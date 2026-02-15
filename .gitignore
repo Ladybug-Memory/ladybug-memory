@@ -1,0 +1,13 @@
+*.swp
+*.swo
+*~
+*.swn
+*.pyc
+.coverage
+.ropeproject
+*.egg-info
+.tox
+build
+.DS_Store
+dist/
+uv.lock
