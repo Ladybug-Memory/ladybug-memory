@@ -1,7 +1,7 @@
 [project]
 name = "ladybug-memory"
-version = "0.1.0"
-description = "Agent memory interface with implementations based on mem0 and engram"
+version = "0.1.1"
+description = "Agent memory interface implemented using LadybugDB"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
