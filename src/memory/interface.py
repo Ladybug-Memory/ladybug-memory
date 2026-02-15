@@ -42,6 +42,15 @@ class AgentMemory(ABC):
         pass
 
     @abstractmethod
+    def semantic_search(
+        self,
+        query: str,
+        limit: int = 5,
+        memory_type: str | None = None,
+    ) -> list[MemorySearchResult]:
+        pass
+
+    @abstractmethod
     def recall(
         self,
         limit: int = 10,

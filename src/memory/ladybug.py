@@ -1,8 +1,10 @@
+import os
 import uuid
 from datetime import datetime
 from typing import Any, cast
 
 import real_ladybug as lb
+from fastembed import TextEmbedding
 
 from memory.interface import (
     AgentMemory,
@@ -22,9 +24,11 @@ class LadybugMemory(AgentMemory):
         self.db = lb.Database(db_path)
         self.conn = lb.Connection(self.db)
         self._init_schema()
+        self._init_vector_search()
 
     def _init_schema(self) -> None:
         self.conn.execute("INSTALL JSON; LOAD EXTENSION JSON;")
+        self.conn.execute("INSTALL vector; LOAD EXTENSION vector;")
         self.conn.execute(
             """
             CREATE NODE TABLE IF NOT EXISTS Memory(
@@ -33,6 +37,7 @@ class LadybugMemory(AgentMemory):
                 memory_type STRING,
                 importance INT64,
                 metadata JSON,
+                embedding FLOAT[384],
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )
@@ -46,6 +51,30 @@ class LadybugMemory(AgentMemory):
             )
             """
         )
+
+    def _init_embedding_model(self) -> None:
+        self._embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+
+    def _get_embedding(self, text: str) -> list[float]:
+        if not hasattr(self, "_embedding_model"):
+            self._init_embedding_model()
+        embeddings = list(self._embedding_model.embed([text]))
+        return embeddings[0]
+
+    def _init_vector_search(self) -> None:
+        try:
+            self.conn.execute(
+                """
+                CALL CREATE_VECTOR_INDEX(
+                    'Memory',
+                    'memory_content_index',
+                    'embedding',
+                    metric := 'cosine'
+                )
+                """
+            )
+        except Exception:
+            pass
 
     def _row_to_entry(self, row: list | dict) -> MemoryEntry:
         if isinstance(row, dict):
@@ -78,6 +107,8 @@ class LadybugMemory(AgentMemory):
         memory_id = str(uuid.uuid4())
         now = datetime.now()
         metadata_json = f"CAST('{str(metadata)}' AS JSON)" if metadata else "NULL"
+        embedding = self._get_embedding(content)
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
         self.conn.execute(
             f"""
@@ -87,6 +118,7 @@ class LadybugMemory(AgentMemory):
                 memory_type: '{memory_type}',
                 importance: {importance},
                 metadata: {metadata_json},
+                embedding: {embedding_str},
                 created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
                 updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
             }})
@@ -136,6 +168,54 @@ class LadybugMemory(AgentMemory):
             row = result.get_next()
             entry = self._row_to_entry(row)
             score = 1.0 if query.lower() in entry.content.lower() else 0.5
+            search_results.append(MemorySearchResult(entry=entry, score=score))
+
+        return search_results
+
+    def semantic_search(
+        self,
+        query: str,
+        limit: int = 5,
+        memory_type: str | None = None,
+    ) -> list[MemorySearchResult]:
+        query_embedding = self._get_embedding(query)
+        embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+        if memory_type:
+            cypher = f"""
+                CALL QUERY_VECTOR_INDEX(
+                    'Memory',
+                    'memory_content_index',
+                    {embedding_str},
+                    {limit}
+                )
+                WITH node AS m, distance
+                WHERE m.memory_type = '{memory_type}'
+                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at, distance
+                ORDER BY distance
+            """
+        else:
+            cypher = f"""
+                CALL QUERY_VECTOR_INDEX(
+                    'Memory',
+                    'memory_content_index',
+                    {embedding_str},
+                    {limit}
+                )
+                WITH node AS m, distance
+                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at, distance
+                ORDER BY distance
+            """
+
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+        search_results = []
+
+        while result.has_next():
+            row = result.get_next()
+            entry = self._row_to_entry(row)
+            distance = float(row[7]) if len(row) > 7 else 0.0
+            score = 1.0 / (1.0 + distance)
             search_results.append(MemorySearchResult(entry=entry, score=score))
 
         return search_results
@@ -210,12 +290,14 @@ class LadybugMemory(AgentMemory):
             return self.get(memory_id)
 
         now = datetime.now()
-        updates.append(f"m.updated_at = timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')")
+        updates.append(
+            f"m.updated_at = timestamp('{now.strftime('%Y-%m-%d %H:%M:%S')}')"
+        )
 
         cypher = f"""
             MATCH (m:Memory)
             WHERE m.id = '{memory_id}'
-            SET {', '.join(updates)}
+            SET {", ".join(updates)}
             RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
         """
 

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "real-ladybug>=0.14.0",
+    "fastembed",
 ]
 
 [project.optional-dependencies]
