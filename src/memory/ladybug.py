@@ -24,10 +24,12 @@ class LadybugMemory(AgentMemory):
         self.db = lb.Database(db_path)
         self.conn = lb.Connection(self.db)
         self._init_schema()
+        self._init_fts_index()
         self._init_vector_search()
 
     def _init_schema(self) -> None:
         self.conn.execute("INSTALL JSON; LOAD EXTENSION JSON;")
+        self.conn.execute("INSTALL FTS; LOAD EXTENSION FTS;")
         self.conn.execute("INSTALL vector; LOAD EXTENSION vector;")
         self.conn.execute(
             """
@@ -51,6 +53,21 @@ class LadybugMemory(AgentMemory):
             )
             """
         )
+
+    def _init_fts_index(self) -> None:
+        try:
+            self.conn.execute(
+                """
+                CALL CREATE_FTS_INDEX(
+                    'Memory',
+                    'memory_content_fts',
+                    ['content'],
+                    stemmer := 'porter'
+                )
+                """
+            )
+        except Exception:
+            pass
 
     def _init_embedding_model(self) -> None:
         self._embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")
@@ -144,20 +161,18 @@ class LadybugMemory(AgentMemory):
     ) -> list[MemorySearchResult]:
         if memory_type:
             cypher = f"""
-                MATCH (m:Memory)
+                CALL QUERY_FTS_INDEX('Memory', 'memory_content_fts', '{query.replace("'", "''")}', top := {limit})
+                WITH node AS m, score
                 WHERE m.memory_type = '{memory_type}'
-                AND m.content CONTAINS '{query.replace("'", "''")}'
-                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
-                ORDER BY m.importance DESC
-                LIMIT {limit}
+                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at, score
+                ORDER BY score DESC
             """
         else:
             cypher = f"""
-                MATCH (m:Memory)
-                WHERE m.content CONTAINS '{query.replace("'", "''")}'
-                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
-                ORDER BY m.importance DESC
-                LIMIT {limit}
+                CALL QUERY_FTS_INDEX('Memory', 'memory_content_fts', '{query.replace("'", "''")}', top := {limit})
+                WITH node AS m, score
+                RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at, score
+                ORDER BY score DESC
             """
 
         raw_result = self.conn.execute(cypher)
@@ -167,7 +182,7 @@ class LadybugMemory(AgentMemory):
         while result.has_next():
             row = result.get_next()
             entry = self._row_to_entry(row)
-            score = 1.0 if query.lower() in entry.content.lower() else 0.5
+            score = float(row[7]) if len(row) > 7 else 1.0
             search_results.append(MemorySearchResult(entry=entry, score=score))
 
         return search_results
