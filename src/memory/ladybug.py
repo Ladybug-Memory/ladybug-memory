@@ -179,25 +179,56 @@ class LadybugMemory(AgentMemory):
     ) -> MemoryEntry:
         memory_id = str(uuid.uuid4())
         now = datetime.now()
-        metadata_json = f"CAST('{str(metadata)}' AS JSON)" if metadata else "NULL"
         embedding = self._get_embedding(content)
-        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        self.conn.execute(
-            f"""
-            CREATE (m:Memory {{
-                id: '{memory_id}',
-                content: '{content.replace("'", "''")}',
-                memory_type: '{memory_type}',
-                importance: {importance},
-                metadata: {metadata_json},
-                embedding: {embedding_str},
-                created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
-                updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
-            }})
-            RETURN m.id
-            """
-        )
+        # Prepare parameters for the query
+        parameters = {
+            "memory_id": memory_id,
+            "content": content,
+            "memory_type": memory_type,
+            "importance": importance,
+            "embedding": embedding.tolist()
+            if hasattr(embedding, "tolist")
+            else embedding,
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        # Handle metadata as JSON if provided
+        if metadata:
+            parameters["metadata"] = str(metadata)
+            self.conn.execute(
+                """
+                CREATE (m:Memory {
+                    id: $memory_id,
+                    content: $content,
+                    memory_type: $memory_type,
+                    importance: $importance,
+                    metadata: CAST($metadata AS JSON),
+                    embedding: $embedding,
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
+                RETURN m.id
+                """,
+                parameters=parameters,
+            )
+        else:
+            self.conn.execute(
+                """
+                CREATE (m:Memory {
+                    id: $memory_id,
+                    content: $content,
+                    memory_type: $memory_type,
+                    importance: $importance,
+                    embedding: $embedding,
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
+                RETURN m.id
+                """,
+                parameters=parameters,
+            )
 
         return MemoryEntry(
             id=memory_id,
