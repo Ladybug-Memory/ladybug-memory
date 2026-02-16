@@ -25,7 +25,7 @@ class LadybugMemory(AgentMemory):
         self,
         db_path: str,
         enable_entity_extraction: bool = True,
-        gliner_model: str = "urchade/gliner_medium-v2.1",
+        gliner_model: str = "fastino/gliner2-base-v1",
         entity_confidence_threshold: float = 0.85,
     ):
         self.db = lb.Database(db_path)

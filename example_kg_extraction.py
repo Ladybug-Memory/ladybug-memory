@@ -16,7 +16,7 @@ def main():
         memory = LadybugMemory(
             db_path=db_path,
             enable_entity_extraction=True,
-            gliner_model="urchade/gliner_medium-v2.1",  # Default model
+            gliner_model="fastino/gliner2-base-v1",  # GLiNER2 model
             entity_confidence_threshold=0.85,
         )
 

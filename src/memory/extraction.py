@@ -1,15 +1,15 @@
-"""GLiNER2 entity extraction module."""
+"""GLiNER2 entity extraction module using fastino-ai/gliner2."""
 
 import uuid
 from typing import Any
 
-from gliner import GLiNER
+from gliner2 import GLiNER2
 
 from memory.entities import Entity, ExtractedEntity
 
 
 class GLiNEREntityExtractor:
-    """Entity extractor using GLiNER2 model with optional confidence-based routing."""
+    """Entity extractor using GLiNER2 model (fastino-ai/gliner2) with optional confidence-based routing."""
 
     DEFAULT_LABELS = [
         "person",
@@ -24,18 +24,18 @@ class GLiNEREntityExtractor:
 
     def __init__(
         self,
-        model_name: str = "urchade/gliner_medium-v2.1",
+        model_name: str = "fastino/gliner2-base-v1",
         confidence_threshold: float = 0.85,
         labels: list[str] | None = None,
     ):
         """Initialize the GLiNER2 extractor.
 
         Args:
-            model_name: HuggingFace model name for GLiNER
+            model_name: HuggingFace model name for GLiNER2
             confidence_threshold: Minimum confidence for entity acceptance
             labels: List of entity labels to extract (uses defaults if None)
         """
-        self.model = GLiNER.from_pretrained(model_name)
+        self.model = GLiNER2.from_pretrained(model_name)
         self.confidence_threshold = confidence_threshold
         self.labels = labels or self.DEFAULT_LABELS
 
@@ -60,20 +60,43 @@ class GLiNEREntityExtractor:
             threshold if threshold is not None else self.confidence_threshold
         )
 
-        predictions = self.model.predict_entities(
-            text, use_labels, threshold=use_threshold
+        # GLiNER2 returns {'entities': {'label': [{'text': ..., 'confidence': ...}]}}
+        result = self.model.extract_entities(
+            text,
+            use_labels,
+            include_confidence=True,
+            include_spans=True,
         )
 
         entities = []
-        for pred in predictions:
-            entity = ExtractedEntity(
-                text=pred["text"],
-                entity_type=pred["label"],
-                confidence=pred["score"],
-                start_pos=pred["start"],
-                end_pos=pred["end"],
-            )
-            entities.append(entity)
+        for entity_type, entity_list in result.get("entities", {}).items():
+            for entity_data in entity_list:
+                # Handle both simple string and dict with metadata
+                if isinstance(entity_data, str):
+                    # Simple text-only extraction (shouldn't happen with include_confidence/spans)
+                    entity = ExtractedEntity(
+                        text=entity_data,
+                        entity_type=entity_type,
+                        confidence=1.0,
+                        start_pos=0,
+                        end_pos=0,
+                    )
+                    # Filter by threshold
+                    if entity.confidence >= use_threshold:
+                        entities.append(entity)
+                else:
+                    # Dict with text, confidence, start, end
+                    confidence = entity_data.get("confidence", 0.0)
+                    # Filter by threshold
+                    if confidence >= use_threshold:
+                        entity = ExtractedEntity(
+                            text=entity_data.get("text", ""),
+                            entity_type=entity_type,
+                            confidence=confidence,
+                            start_pos=entity_data.get("start", 0),
+                            end_pos=entity_data.get("end", 0),
+                        )
+                        entities.append(entity)
 
         return entities
 
@@ -102,10 +125,8 @@ class GLiNEREntityExtractor:
             metadata = context.copy() if context else {}
             metadata.update(
                 {
-                    "extractor": "gliner",
-                    "model": self.model.config.name_or_path
-                    if hasattr(self.model, "config")
-                    else "gliner",
+                    "extractor": "gliner2",
+                    "model": "fastino/gliner2",
                 }
             )
 
@@ -139,12 +160,26 @@ class GLiNEREntityExtractor:
             List of (start, end, confidence) tuples for low-confidence spans
         """
         use_labels = labels or self.labels
-        predictions = self.model.predict_entities(text, use_labels, threshold=0.0)
+        result = self.model.extract_entities(
+            text,
+            use_labels,
+            include_confidence=True,
+            include_spans=True,
+        )
 
         low_confidence = []
-        for pred in predictions:
-            if pred["score"] < self.confidence_threshold:
-                low_confidence.append((pred["start"], pred["end"], pred["score"]))
+        for entity_type, entity_list in result.get("entities", {}).items():
+            for entity_data in entity_list:
+                if isinstance(entity_data, dict):
+                    confidence = entity_data.get("confidence", 0.0)
+                    if confidence < self.confidence_threshold:
+                        low_confidence.append(
+                            (
+                                entity_data.get("start", 0),
+                                entity_data.get("end", 0),
+                                confidence,
+                            )
+                        )
 
         return low_confidence
 
