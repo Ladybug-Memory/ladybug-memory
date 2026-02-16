@@ -1,4 +1,3 @@
-import os
 import uuid
 from datetime import datetime
 from typing import Any, cast
@@ -6,6 +5,8 @@ from typing import Any, cast
 import real_ladybug as lb
 from fastembed import TextEmbedding
 
+from memory.entities import Entity
+from memory.extraction import GLiNEREntityExtractor
 from memory.interface import (
     AgentMemory,
     MemoryEntry,
@@ -20,12 +21,27 @@ def _get_result(result: lb.QueryResult | list[lb.QueryResult]) -> lb.QueryResult
 
 
 class LadybugMemory(AgentMemory):
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        enable_entity_extraction: bool = True,
+        gliner_model: str = "urchade/gliner_medium-v2.1",
+        entity_confidence_threshold: float = 0.85,
+    ):
         self.db = lb.Database(db_path)
         self.conn = lb.Connection(self.db)
         self._init_schema()
         self._init_fts_index()
         self._init_vector_search()
+
+        # Entity extraction
+        self._enable_entity_extraction = enable_entity_extraction
+        self._entity_extractor: GLiNEREntityExtractor | None = None
+        if enable_entity_extraction:
+            self._entity_extractor = GLiNEREntityExtractor(
+                model_name=gliner_model,
+                confidence_threshold=entity_confidence_threshold,
+            )
 
     def _init_schema(self) -> None:
         self.conn.execute("INSTALL JSON; LOAD EXTENSION JSON;")
@@ -50,6 +66,46 @@ class LadybugMemory(AgentMemory):
             CREATE REL TABLE IF NOT EXISTS MemoryLink(
                 FROM Memory TO Memory,
                 relation STRING
+            )
+            """
+        )
+        # Entity schema for knowledge graph
+        self._init_entity_schema()
+
+    def _init_entity_schema(self) -> None:
+        """Initialize entity and mention tables for knowledge graph."""
+        # Entity nodes (canonical entities after disambiguation)
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS Entity(
+                id STRING PRIMARY KEY,
+                canonical_name STRING,
+                entity_type STRING,
+                embedding FLOAT[384],
+                metadata JSON,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        # Entity mention edges (links entities to memories)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS MentionedIn(
+                FROM Entity TO Memory,
+                mention_text STRING,
+                confidence FLOAT,
+                span_start INT64,
+                span_end INT64
+            )
+            """
+        )
+        # Coreference edges (links similar entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Coreference(
+                FROM Entity TO Entity,
+                similarity_score FLOAT
             )
             """
         )
@@ -295,7 +351,8 @@ class LadybugMemory(AgentMemory):
         updates = []
 
         if content is not None:
-            updates.append(f"m.content = '{content.replace("'", "''")}'")
+            escaped_content = content.replace("'", "''")
+            updates.append(f"m.content = '{escaped_content}'")
         if importance is not None:
             updates.append(f"m.importance = {importance}")
         if metadata is not None:
@@ -403,3 +460,285 @@ class LadybugMemory(AgentMemory):
             return int(row[0])
 
         return 0
+
+    # Entity extraction methods
+    def extract_entities(
+        self,
+        content: str,
+        labels: list[str] | None = None,
+        threshold: float | None = None,
+    ) -> list[Entity]:
+        """Extract entities from content using GLiNER2.
+
+        Args:
+            content: The text to extract entities from
+            labels: Entity types to extract (uses defaults if None)
+            threshold: Confidence threshold (uses default if None)
+
+        Returns:
+            List of extracted entities
+        """
+        if not self._entity_extractor:
+            raise RuntimeError(
+                "Entity extraction is not enabled. Initialize with enable_entity_extraction=True"
+            )
+
+        return self._entity_extractor.extract_with_context(
+            content, labels=labels, threshold=threshold
+        )
+
+    def store_with_entities(
+        self,
+        content: str,
+        memory_type: str = "general",
+        importance: int = 5,
+        metadata: dict[str, Any] | None = None,
+        extract_entities: bool = True,
+    ) -> tuple[MemoryEntry, list[Entity]]:
+        """Store memory and optionally extract/link entities.
+
+        Args:
+            content: The memory content
+            memory_type: Type of memory
+            importance: Importance score
+            metadata: Additional metadata
+            extract_entities: Whether to extract and link entities
+
+        Returns:
+            Tuple of (MemoryEntry, list of extracted entities)
+        """
+        # Store the memory first
+        entry = self.store(content, memory_type, importance, metadata)
+
+        entities: list[Entity] = []
+        if extract_entities and self._entity_extractor:
+            # Extract entities
+            entities = self._entity_extractor.extract_with_context(content)
+
+            # Store entities and create mentions
+            for entity in entities:
+                self._store_entity_mention(entity, entry.id)
+
+        return entry, entities
+
+    def _store_entity_mention(self, entity: Entity, memory_id: str) -> None:
+        """Store an entity mention and link it to a memory.
+
+        Args:
+            entity: The extracted entity
+            memory_id: The ID of the memory containing the entity
+        """
+        now = datetime.now()
+
+        # Check if entity already exists (by canonical name + type)
+        check_cypher = f"""
+            MATCH (e:Entity)
+            WHERE e.canonical_name = '{entity.text.replace("'", "''")}'
+            AND e.entity_type = '{entity.entity_type}'
+            RETURN e.id
+        """
+        raw_result = self.conn.execute(check_cypher)
+        result = _get_result(raw_result)
+
+        entity_id: str
+        if result.has_next():
+            # Entity exists, use existing ID
+            row = result.get_next()
+            entity_id = str(row[0])
+        else:
+            # Create new entity
+            entity_id = str(uuid.uuid4())
+            embedding = self._get_embedding(entity.text)
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+            create_cypher = f"""
+                CREATE (e:Entity {{
+                    id: '{entity_id}',
+                    canonical_name: '{entity.text.replace("'", "''")}',
+                    entity_type: '{entity.entity_type}',
+                    embedding: {embedding_str},
+                    metadata: NULL,
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
+                    updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+                RETURN e.id
+            """
+            self.conn.execute(create_cypher)
+
+        # Create mention relationship
+        mention_cypher = f"""
+            MATCH (e:Entity), (m:Memory)
+            WHERE e.id = '{entity_id}' AND m.id = '{memory_id}'
+            CREATE (e)-[r:MentionedIn {{
+                mention_text: '{entity.text.replace("'", "''")}',
+                confidence: {entity.confidence},
+                span_start: {entity.start_pos},
+                span_end: {entity.end_pos}
+            }}]->(m)
+        """
+        self.conn.execute(mention_cypher)
+
+    def search_by_entity(
+        self,
+        entity_name: str,
+        limit: int = 5,
+    ) -> list[MemorySearchResult]:
+        """Find memories mentioning a specific entity.
+
+        Args:
+            entity_name: The entity name to search for
+            limit: Maximum number of results
+
+        Returns:
+            List of memories containing the entity
+        """
+        cypher = f"""
+            MATCH (e:Entity)-[r:MentionedIn]->(m:Memory)
+            WHERE e.canonical_name = '{entity_name.replace("'", "''")}'
+            RETURN m.id, m.content, m.memory_type, m.importance, m.metadata,
+                   m.created_at, m.updated_at, r.confidence
+            ORDER BY r.confidence DESC, m.importance DESC
+            LIMIT {limit}
+        """
+
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+        search_results = []
+
+        while result.has_next():
+            row = result.get_next()
+            entry = self._row_to_entry(row)
+            confidence = float(row[7]) if len(row) > 7 else 1.0
+            search_results.append(MemorySearchResult(entry=entry, score=confidence))
+
+        return search_results
+
+    def get_entity_graph(
+        self,
+        entity_id: str,
+        max_depth: int = 1,
+    ) -> dict[str, Any]:
+        """Get connected entities and their relationships.
+
+        Args:
+            entity_id: The entity ID to explore
+            max_depth: Maximum relationship depth
+
+        Returns:
+            Dictionary with entity and related entities
+        """
+        # Get the main entity
+        entity_cypher = f"""
+            MATCH (e:Entity)
+            WHERE e.id = '{entity_id}'
+            RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+        """
+        raw_result = self.conn.execute(entity_cypher)
+        result = _get_result(raw_result)
+
+        if not result.has_next():
+            return {}
+
+        row = result.get_next()
+        entity_data = {
+            "id": str(row[0]),
+            "canonical_name": str(row[1]),
+            "entity_type": str(row[2]),
+            "metadata": row[3],
+        }
+
+        # Get related entities via coreference
+        related_cypher = f"""
+            MATCH (e:Entity)-[c:Coreference]->(related:Entity)
+            WHERE e.id = '{entity_id}'
+            RETURN related.id, related.canonical_name, related.entity_type, c.similarity_score
+        """
+        raw_result = self.conn.execute(related_cypher)
+        result = _get_result(raw_result)
+
+        related_entities = []
+        while result.has_next():
+            row = result.get_next()
+            related_entities.append(
+                {
+                    "id": str(row[0]),
+                    "canonical_name": str(row[1]),
+                    "entity_type": str(row[2]),
+                    "similarity_score": float(row[3]) if row[3] else 0.0,
+                }
+            )
+
+        # Get mentioned memories
+        memories_cypher = f"""
+            MATCH (e:Entity)-[r:MentionedIn]->(m:Memory)
+            WHERE e.id = '{entity_id}'
+            RETURN m.id, m.content, r.confidence
+            ORDER BY r.confidence DESC
+            LIMIT 10
+        """
+        raw_result = self.conn.execute(memories_cypher)
+        result = _get_result(raw_result)
+
+        mentioned_memories = []
+        while result.has_next():
+            row = result.get_next()
+            mentioned_memories.append(
+                {
+                    "memory_id": str(row[0]),
+                    "content_preview": str(row[1])[:200] + "..."
+                    if len(str(row[1])) > 200
+                    else str(row[1]),
+                    "mention_confidence": float(row[2]) if row[2] else 0.0,
+                }
+            )
+
+        return {
+            "entity": entity_data,
+            "related_entities": related_entities,
+            "mentioned_in": mentioned_memories,
+        }
+
+    def get_all_entities(
+        self,
+        entity_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get all entities, optionally filtered by type.
+
+        Args:
+            entity_type: Filter by entity type (optional)
+            limit: Maximum number of results
+
+        Returns:
+            List of entity dictionaries
+        """
+        if entity_type:
+            cypher = f"""
+                MATCH (e:Entity)
+                WHERE e.entity_type = '{entity_type}'
+                RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+                LIMIT {limit}
+            """
+        else:
+            cypher = f"""
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+                LIMIT {limit}
+            """
+
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+
+        entities = []
+        while result.has_next():
+            row = result.get_next()
+            entities.append(
+                {
+                    "id": str(row[0]),
+                    "canonical_name": str(row[1]),
+                    "entity_type": str(row[2]),
+                    "metadata": row[3],
+                }
+            )
+
+        return entities
