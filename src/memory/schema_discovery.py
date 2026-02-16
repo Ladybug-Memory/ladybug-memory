@@ -12,13 +12,17 @@ from dataclasses import dataclass
 import uuid
 import numpy as np
 import pyarrow as pa
-import polars as pl
 
 # Note: icebug provides networkit-compatible API
 import networkit as nk
 from fastembed import TextEmbedding
 
 from memory.entities import Entity
+
+# Global registry to keep Arrow arrays alive
+# Key: graph id, Value: dict with Arrow arrays
+# Using weakref allows cleanup when graph is garbage collected
+_arrow_registry = {}
 
 
 @dataclass
@@ -113,22 +117,19 @@ class DynamicSchemaDiscovery:
             graph = nk.Graph(len(entities))
             return graph, entities
 
-        df = pl.DataFrame(
-            {
-                "source": pl.Series(sources, dtype=pl.UInt64),
-                "target": pl.Series(targets, dtype=pl.UInt64),
-            }
-        )
+        # Remap node IDs to consecutive integers (CSR requires 0 to n-1)
+        # IMPORTANT: Map ALL entity indices (0 to len(entities)-1) to ensure partition aligns
+        unique_nodes = list(range(len(entities)))
+        node_map = {old_id: new_id for new_id, old_id in enumerate(unique_nodes)}
 
-        # Build CSR format
-        sources_list = df["source"].to_list()
-        targets_list = df["target"].to_list()
+        sources_list = [node_map[s] for s in sources]
+        targets_list = [node_map[t] for t in targets]
 
         # Undirected graph - add reverse edges
         all_sources = sources_list + targets_list
         all_targets = targets_list + sources_list
 
-        n_nodes = len(entities)
+        n_nodes = len(unique_nodes)
 
         # Build CSR indptr
         indptr = [0] * (n_nodes + 1)
@@ -152,6 +153,14 @@ class DynamicSchemaDiscovery:
 
         # Create graph
         graph = nk.Graph.fromCSR(n_nodes, False, indices_arrow, indptr_arrow)
+
+        # CRITICAL: Keep Arrow arrays alive by storing them in a registry keyed by graph id
+        # The C++ CSR graph holds raw pointers to the Arrow array data
+        graph_id = id(graph)
+        _arrow_registry[graph_id] = {
+            "indices": indices_arrow,
+            "indptr": indptr_arrow,
+        }
 
         return graph, entities
 
