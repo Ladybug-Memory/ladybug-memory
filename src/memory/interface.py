@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass
 class MemoryEntry:
-    id: str
+    id: int
     content: str
     memory_type: str = "general"
     importance: int = 5

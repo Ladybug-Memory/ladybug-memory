@@ -9,7 +9,7 @@ from typing import Any
 class Entity:
     """Represents an extracted entity mention."""
 
-    id: str
+    id: int | None
     text: str
     entity_type: str
     confidence: float
@@ -22,8 +22,8 @@ class Entity:
 class EntityMention:
     """Represents a specific mention of an entity in content."""
 
-    entity_id: str
-    memory_id: str
+    entity_id: int
+    memory_id: int
     text: str
     start_pos: int
     end_pos: int
@@ -35,7 +35,7 @@ class EntityMention:
 class CanonicalEntity:
     """Represents a canonical entity after disambiguation."""
 
-    id: str
+    id: int
     canonical_name: str
     entity_type: str
     aliases: list[str]

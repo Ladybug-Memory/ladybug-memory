@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Example demonstrating GLiNER2 entity extraction with ladybug-memory."""
 
-from memory import LadybugMemory, GLiNEREntityExtractor
+from memory import LadybugMemory
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
     entities = memory.extract_entities(text)
 
     print(f"   Text: {text}")
-    print(f"   Extracted entities:")
+    print("   Extracted entities:")
     for entity in entities:
         print(
             f"   - {entity.text} ({entity.entity_type}, confidence: {entity.confidence:.3f})"
