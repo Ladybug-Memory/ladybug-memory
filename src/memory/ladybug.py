@@ -742,3 +742,229 @@ class LadybugMemory(AgentMemory):
             )
 
         return entities
+
+    # Dynamic schema methods
+    def create_dynamic_schema_tables(
+        self,
+        discovered_schemas: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Create node and relationship tables for discovered schemas.
+
+        Args:
+            discovered_schemas: List of discovered schema types from clustering
+
+        Returns:
+            Dictionary mapping schema type names to table names
+        """
+        table_mapping = {}
+
+        for schema in discovered_schemas:
+            type_name = schema["type_name"]
+            confidence = schema.get("confidence", 0.0)
+
+            # Only create tables for high-confidence schemas
+            if confidence < 0.6:
+                continue
+
+            # Sanitize type name for table name
+            table_name = self._sanitize_table_name(type_name)
+
+            # Check if table already exists
+            try:
+                # Create node table for this entity type
+                self.conn.execute(
+                    f"""
+                    CREATE NODE TABLE IF NOT EXISTS {table_name}(
+                        id STRING PRIMARY KEY,
+                        canonical_name STRING,
+                        entity_type STRING DEFAULT '{type_name}',
+                        embedding FLOAT[384],
+                        metadata JSON,
+                        discovered_confidence FLOAT DEFAULT {confidence},
+                        created_at TIMESTAMP,
+                        updated_at TIMESTAMP
+                    )
+                    """
+                )
+
+                # Create relationship table for mentions
+                rel_table_name = f"MentionedIn_{table_name}"
+                self.conn.execute(
+                    f"""
+                    CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
+                        FROM {table_name} TO Memory,
+                        mention_text STRING,
+                        confidence FLOAT,
+                        span_start INT64,
+                        span_end INT64
+                    )
+                    """
+                )
+
+                table_mapping[type_name] = table_name
+
+            except Exception as e:
+                # Table might already exist or other error
+                print(f"Warning: Could not create table for {type_name}: {e}")
+                continue
+
+        return table_mapping
+
+    def _sanitize_table_name(self, name: str) -> str:
+        """Sanitize a schema type name for use as a table name."""
+        # Replace spaces and special characters with underscores
+        import re
+
+        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        # Ensure it starts with a letter
+        if sanitized[0].isdigit():
+            sanitized = "Entity_" + sanitized
+        return sanitized
+
+    def store_with_dynamic_schema(
+        self,
+        content: str,
+        memory_type: str = "general",
+        importance: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[MemoryEntry, dict[str, Any]]:
+        """Store memory and discover/create dynamic schema for entities.
+
+        Args:
+            content: The memory content
+            memory_type: Type of memory
+            importance: Importance score
+            metadata: Additional metadata
+
+        Returns:
+            Tuple of (MemoryEntry, schema discovery results)
+        """
+        # Store the memory first
+        entry = self.store(content, memory_type, importance, metadata)
+
+        results = {
+            "entities": [],
+            "discovered_schemas": [],
+            "table_mapping": {},
+            "entity_to_type": {},
+        }
+
+        if not self._entity_extractor:
+            return entry, results
+
+        # Extract entities (without predefined schema)
+        from memory.schema_discovery import DynamicSchemaDiscovery
+
+        extractor = self._entity_extractor
+
+        # Extract with broad labels to get entities
+        entities = extractor.extract_with_context(
+            content,
+            context={"memory_id": entry.id, "memory_type": memory_type},
+        )
+
+        results["entities"] = entities
+
+        if len(entities) == 0:
+            return entry, results
+
+        # Discover schema through clustering
+        schema_discovery = DynamicSchemaDiscovery(
+            similarity_threshold=0.75,
+            min_cluster_size=2,
+            min_confidence=0.6,
+        )
+
+        discovered_schemas, entity_to_type = schema_discovery.discover_schema(entities)
+
+        results["discovered_schemas"] = [
+            {
+                "type_name": s.type_name,
+                "confidence": s.confidence,
+                "sample_entities": s.sample_entities,
+                "cluster_id": s.cluster_id,
+                "size": s.size,
+            }
+            for s in discovered_schemas
+        ]
+        results["entity_to_type"] = entity_to_type
+
+        # Create dynamic tables for discovered schemas
+        if discovered_schemas:
+            table_mapping = self.create_dynamic_schema_tables(
+                results["discovered_schemas"]
+            )
+            results["table_mapping"] = table_mapping
+
+            # Store entities in their respective type tables
+            for entity in entities:
+                if entity.id in entity_to_type:
+                    entity_type = entity_to_type[entity.id]
+                    if entity_type in table_mapping:
+                        table_name = table_mapping[entity_type]
+                        self._store_entity_in_typed_table(entity, entry.id, table_name)
+
+        return entry, results
+
+    def _store_entity_in_typed_table(
+        self,
+        entity: Entity,
+        memory_id: str,
+        table_name: str,
+    ) -> None:
+        """Store an entity in a type-specific table.
+
+        Args:
+            entity: The entity to store
+            memory_id: ID of the memory mentioning the entity
+            table_name: Name of the type-specific table
+        """
+        now = datetime.now()
+
+        # Check if entity already exists
+        check_cypher = f"""
+            MATCH (e:{table_name})
+            WHERE e.canonical_name = '{entity.text.replace("'", "''")}'
+            RETURN e.id
+        """
+        raw_result = self.conn.execute(check_cypher)
+        result = _get_result(raw_result)
+
+        entity_id: str
+        if result.has_next():
+            # Entity exists, use existing ID
+            row = result.get_next()
+            entity_id = str(row[0])
+        else:
+            # Create new entity
+            entity_id = str(uuid.uuid4())
+            embedding = self._get_embedding(entity.text)
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+            create_cypher = f"""
+                CREATE (e:{table_name} {{
+                    id: '{entity_id}',
+                    canonical_name: '{entity.text.replace("'", "''")}',
+                    entity_type: '{entity.entity_type}',
+                    embedding: {embedding_str},
+                    metadata: NULL,
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
+                    updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+                RETURN e.id
+            """
+            self.conn.execute(create_cypher)
+
+        # Create mention relationship
+        rel_table_name = f"MentionedIn_{table_name}"
+        mention_cypher = f"""
+            MATCH (e:{table_name}), (m:Memory)
+            WHERE e.id = '{entity_id}' AND m.id = '{memory_id}'
+            CREATE (e)-[r:{rel_table_name} {{
+                mention_text: '{entity.text.replace("'", "''")}',
+                confidence: {entity.confidence},
+                span_start: {entity.start_pos},
+                span_end: {entity.end_pos}
+            }}]->(m)
+        """
+        self.conn.execute(mention_cypher)
