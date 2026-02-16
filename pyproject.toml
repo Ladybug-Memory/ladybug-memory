@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "real-ladybug>=0.14.0",
     "fastembed",
-    "gliner>=0.2.0",
+    "gliner2>=0.0.1",
 ]
 
 [project.optional-dependencies]
