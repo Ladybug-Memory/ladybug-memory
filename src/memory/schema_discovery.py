@@ -9,7 +9,6 @@ This module discovers entity schemas dynamically by:
 """
 
 from dataclasses import dataclass
-from typing import Any
 import uuid
 import numpy as np
 import pyarrow as pa

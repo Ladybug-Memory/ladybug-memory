@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime
 from typing import Any, cast
 
@@ -50,7 +49,7 @@ class LadybugMemory(AgentMemory):
         self.conn.execute(
             """
             CREATE NODE TABLE IF NOT EXISTS Memory(
-                id STRING PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 content STRING,
                 memory_type STRING,
                 importance INT64,
@@ -78,7 +77,7 @@ class LadybugMemory(AgentMemory):
         self.conn.execute(
             """
             CREATE NODE TABLE IF NOT EXISTS Entity(
-                id STRING PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 canonical_name STRING,
                 entity_type STRING,
                 embedding FLOAT[384],
@@ -152,7 +151,7 @@ class LadybugMemory(AgentMemory):
     def _row_to_entry(self, row: list | dict) -> MemoryEntry:
         if isinstance(row, dict):
             return MemoryEntry(
-                id=cast(str, row.get("id")),
+                id=cast(int, row.get("id")),
                 content=cast(str, row.get("content")),
                 memory_type=cast(str, row.get("memory_type")),
                 importance=cast(int, row.get("importance")),
@@ -161,7 +160,7 @@ class LadybugMemory(AgentMemory):
                 updated_at=cast(datetime, row.get("updated_at")),
             )
         return MemoryEntry(
-            id=str(row[0]),
+            id=int(row[0]),
             content=str(row[1]),
             memory_type=str(row[2]),
             importance=int(row[3]),
@@ -177,13 +176,11 @@ class LadybugMemory(AgentMemory):
         importance: int = 5,
         metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry:
-        memory_id = str(uuid.uuid4())
         now = datetime.now()
         embedding = self._get_embedding(content)
 
         # Prepare parameters for the query
         parameters = {
-            "memory_id": memory_id,
             "content": content,
             "memory_type": memory_type,
             "importance": importance,
@@ -197,10 +194,9 @@ class LadybugMemory(AgentMemory):
         # Handle metadata as JSON if provided
         if metadata:
             parameters["metadata"] = str(metadata)
-            self.conn.execute(
+            raw_result = self.conn.execute(
                 """
                 CREATE (m:Memory {
-                    id: $memory_id,
                     content: $content,
                     memory_type: $memory_type,
                     importance: $importance,
@@ -214,10 +210,9 @@ class LadybugMemory(AgentMemory):
                 parameters=parameters,
             )
         else:
-            self.conn.execute(
+            raw_result = self.conn.execute(
                 """
                 CREATE (m:Memory {
-                    id: $memory_id,
                     content: $content,
                     memory_type: $memory_type,
                     importance: $importance,
@@ -229,6 +224,10 @@ class LadybugMemory(AgentMemory):
                 """,
                 parameters=parameters,
             )
+
+        result = _get_result(raw_result)
+        row = result.get_next()
+        memory_id = int(row[0])
 
         return MemoryEntry(
             id=memory_id,
@@ -359,7 +358,7 @@ class LadybugMemory(AgentMemory):
     def get(self, memory_id: str) -> MemoryEntry | None:
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
         """
 
@@ -399,7 +398,7 @@ class LadybugMemory(AgentMemory):
 
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             SET {", ".join(updates)}
             RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
         """
@@ -416,7 +415,7 @@ class LadybugMemory(AgentMemory):
     def delete(self, memory_id: str) -> bool:
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             DELETE m
         """
 
@@ -431,7 +430,7 @@ class LadybugMemory(AgentMemory):
     ) -> bool:
         cypher = f"""
             MATCH (a:Memory), (b:Memory)
-            WHERE a.id = '{source_id}' AND b.id = '{target_id}'
+            WHERE a.id = {source_id} AND b.id = {target_id}
             CREATE (a)-[r:MemoryLink {{relation: '{relation}'}}]->(b)
         """
 
@@ -447,13 +446,13 @@ class LadybugMemory(AgentMemory):
         if relation:
             cypher = f"""
                 MATCH (m:Memory)-[r:MemoryLink {{relation: '{relation}'}}]->(related:Memory)
-                WHERE m.id = '{memory_id}'
+                WHERE m.id = {memory_id}
                 RETURN related.id, related.content, related.memory_type, related.importance, related.metadata, related.created_at, related.updated_at, r.relation
             """
         else:
             cypher = f"""
                 MATCH (m:Memory)-[r:MemoryLink]->(related:Memory)
-                WHERE m.id = '{memory_id}'
+                WHERE m.id = {memory_id}
                 RETURN related.id, related.content, related.memory_type, related.importance, related.metadata, related.created_at, related.updated_at, r.relation
             """
 
@@ -578,13 +577,11 @@ class LadybugMemory(AgentMemory):
             entity_id = str(row[0])
         else:
             # Create new entity
-            entity_id = str(uuid.uuid4())
             embedding = self._get_embedding(entity.text)
             embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
             create_cypher = f"""
                 CREATE (e:Entity {{
-                    id: '{entity_id}',
                     canonical_name: '{entity.text.replace("'", "''")}',
                     entity_type: '{entity.entity_type}',
                     embedding: {embedding_str},
@@ -594,12 +591,15 @@ class LadybugMemory(AgentMemory):
                 }})
                 RETURN e.id
             """
-            self.conn.execute(create_cypher)
+            raw_result = self.conn.execute(create_cypher)
+            result = _get_result(raw_result)
+            row = result.get_next()
+            entity_id = str(row[0])
 
         # Create mention relationship
         mention_cypher = f"""
             MATCH (e:Entity), (m:Memory)
-            WHERE e.id = '{entity_id}' AND m.id = '{memory_id}'
+            WHERE e.id = {entity_id} AND m.id = {memory_id}
             CREATE (e)-[r:MentionedIn {{
                 mention_text: '{entity.text.replace("'", "''")}',
                 confidence: {entity.confidence},
@@ -661,7 +661,7 @@ class LadybugMemory(AgentMemory):
         # Get the main entity
         entity_cypher = f"""
             MATCH (e:Entity)
-            WHERE e.id = '{entity_id}'
+            WHERE e.id = {entity_id}
             RETURN e.id, e.canonical_name, e.entity_type, e.metadata
         """
         raw_result = self.conn.execute(entity_cypher)
@@ -681,7 +681,7 @@ class LadybugMemory(AgentMemory):
         # Get related entities via coreference
         related_cypher = f"""
             MATCH (e:Entity)-[c:Coreference]->(related:Entity)
-            WHERE e.id = '{entity_id}'
+            WHERE e.id = {entity_id}
             RETURN related.id, related.canonical_name, related.entity_type, c.similarity_score
         """
         raw_result = self.conn.execute(related_cypher)
@@ -702,7 +702,7 @@ class LadybugMemory(AgentMemory):
         # Get mentioned memories
         memories_cypher = f"""
             MATCH (e:Entity)-[r:MentionedIn]->(m:Memory)
-            WHERE e.id = '{entity_id}'
+            WHERE e.id = {entity_id}
             RETURN m.id, m.content, r.confidence
             ORDER BY r.confidence DESC
             LIMIT 10
@@ -806,7 +806,7 @@ class LadybugMemory(AgentMemory):
                 self.conn.execute(
                     f"""
                     CREATE NODE TABLE IF NOT EXISTS {table_name}(
-                        id STRING PRIMARY KEY,
+                        id SERIAL PRIMARY KEY,
                         canonical_name STRING,
                         entity_type STRING DEFAULT '{type_name}',
                         embedding FLOAT[384],
@@ -968,13 +968,11 @@ class LadybugMemory(AgentMemory):
             entity_id = str(row[0])
         else:
             # Create new entity
-            entity_id = str(uuid.uuid4())
             embedding = self._get_embedding(entity.text)
             embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
             create_cypher = f"""
                 CREATE (e:{table_name} {{
-                    id: '{entity_id}',
                     canonical_name: '{entity.text.replace("'", "''")}',
                     entity_type: '{entity.entity_type}',
                     embedding: {embedding_str},
@@ -984,13 +982,16 @@ class LadybugMemory(AgentMemory):
                 }})
                 RETURN e.id
             """
-            self.conn.execute(create_cypher)
+            raw_result = self.conn.execute(create_cypher)
+            result = _get_result(raw_result)
+            row = result.get_next()
+            entity_id = str(row[0])
 
         # Create mention relationship
         rel_table_name = f"MentionedIn_{table_name}"
         mention_cypher = f"""
             MATCH (e:{table_name}), (m:Memory)
-            WHERE e.id = '{entity_id}' AND m.id = '{memory_id}'
+            WHERE e.id = {entity_id} AND m.id = {memory_id}
             CREATE (e)-[r:{rel_table_name} {{
                 mention_text: '{entity.text.replace("'", "''")}',
                 confidence: {entity.confidence},
