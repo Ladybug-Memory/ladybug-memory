@@ -8,14 +8,18 @@ This module discovers entity schemas dynamically by:
 5. Creating dynamic tables in ladybug for discovered schemas
 """
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+import os
 import uuid
+
 import numpy as np
 import pyarrow as pa
 
 # Note: icebug provides networkit-compatible API
 import networkit as nk
 from fastembed import TextEmbedding
+from litellm import completion
 
 from memory.entities import Entity
 
@@ -30,9 +34,6 @@ def _generate_type_name_with_llm(
 ) -> str:
     """Use LLM to generate a descriptive type name for a cluster of entities."""
     try:
-        import os
-        from litellm import completion
-
         entity_list = ", ".join(entities[:15])
         prompt = f"""Given these entities of type "{base_type}": {entity_list}
 
@@ -78,7 +79,8 @@ Respond with ONLY the type name, no explanation."""
 class DiscoveredSchema:
     """A discovered schema type from clustering."""
 
-    type_name: str
+    type_name: str  # Specific type (e.g., "HealthConsortium")
+    base_type: str  # GLiNER2 base type (e.g., "organization")
     confidence: float
     sample_entities: list[str]
     cluster_id: int
@@ -226,19 +228,28 @@ class DynamicSchemaDiscovery:
         Returns:
             Partition object with cluster assignments
         """
-        # Create ParallelLeidenView instance
-        # Use minimal iterations for speed
-        leiden = nk.community.ParallelLeidenView(
-            graph, iterations=1, randomize=False, gamma=0.5
-        )
+        n_nodes = graph.numberOfNodes()
+        n_edges = graph.numberOfEdges()
 
-        # Run clustering
-        leiden.run()
+        # For small or sparse graphs, use simpler approach
+        if n_nodes < 3 or n_edges < 2:
+            # Return each node in its own cluster
+            partition = nk.structures.Partition(n_nodes)
+            for i in range(n_nodes):
+                partition.addToSubset(i, i)
+            return partition
 
-        # Get partition
-        partition = leiden.getPartition()
-
-        return partition
+        # Use PLM (Parallel Louvain Method)
+        try:
+            plm = nk.community.PLM(graph, gamma=0.5)
+            plm.run()
+            return plm.getPartition()
+        except Exception:
+            # Fallback: each entity is its own cluster
+            partition = nk.structures.Partition(n_nodes)
+            for i in range(n_nodes):
+                partition.addToSubset(i, i)
+            return partition
 
     def _analyze_clusters(
         self,
@@ -291,13 +302,17 @@ class DynamicSchemaDiscovery:
             if confidence < self.min_confidence:
                 continue
 
+            # Get base type from cluster entities
+            base_type = self._get_base_type(cluster_ents)
+
             # Infer type name from GLiNER2 entity types
             sample_texts = [e.text for e in cluster_ents[:5]]
-            type_name = self._infer_type_name(cluster_ents)
+            type_name = self._infer_type_name(cluster_ents, base_type)
 
             discovered_schemas.append(
                 DiscoveredSchema(
                     type_name=type_name,
+                    base_type=base_type,
                     confidence=confidence,
                     sample_entities=sample_texts,
                     cluster_id=cluster_id,
@@ -310,18 +325,21 @@ class DynamicSchemaDiscovery:
 
         return discovered_schemas
 
-    def _infer_type_name(self, entities: list[Entity]) -> str:
+    def _get_base_type(self, entities: list[Entity]) -> str:
+        """Get the most common GLiNER2 base type from entities."""
+        type_counts = Counter([e.entity_type for e in entities])
+        return type_counts.most_common(1)[0][0] if type_counts else "unknown"
+
+    def _infer_type_name(self, entities: list[Entity], base_type: str) -> str:
         """Infer a descriptive type name from cluster entities.
 
         Uses LLM to generate a specific type name based on the entities.
         Falls back to the GLiNER2 entity_type if LLM is disabled or fails.
+
+        Args:
+            entities: List of entities in the cluster
+            base_type: The GLiNER2 base type (e.g., "organization", "location")
         """
-        from collections import Counter
-
-        # Get base type from GLiNER2
-        type_counts = Counter([e.entity_type for e in entities])
-        base_type = type_counts.most_common(1)[0][0] if type_counts else "unknown"
-
         # If LLM is enabled, generate a descriptive name
         if self.llm_model:
             entity_texts = [e.text for e in entities[:20]]
@@ -335,6 +353,9 @@ class DynamicSchemaDiscovery:
     ) -> tuple[list[DiscoveredSchema], dict[str, str]]:
         """Discover schema types from entities.
 
+        Clusters entities by GLiNER2 base type first, then runs clustering
+        within each type group to prevent mixing (e.g., locations with organizations).
+
         Args:
             entities: List of extracted entities
 
@@ -344,25 +365,46 @@ class DynamicSchemaDiscovery:
         if len(entities) == 0:
             return [], {}
 
-        # Build similarity graph
-        graph, filtered_entities, embeddings_norm = self._build_similarity_graph(
-            entities
-        )
+        # Group entities by GLiNER2 base type first
+        entities_by_type: dict[str, list[Entity]] = defaultdict(list)
+        for entity in entities:
+            entities_by_type[entity.entity_type].append(entity)
 
-        # Run leiden clustering
-        partition = self._run_leiden_clustering(graph)
-
-        # Analyze clusters (pass embeddings to avoid recomputing)
-        schemas = self._analyze_clusters(filtered_entities, partition, embeddings_norm)
-
-        # Create entity to type mapping
+        all_schemas: list[DiscoveredSchema] = []
         entity_to_type: dict[str, str] = {}
-        cluster_to_type: dict[int, str] = {s.cluster_id: s.type_name for s in schemas}
 
-        for node_id in range(len(filtered_entities)):
-            cluster_id = partition[node_id]
-            if cluster_id in cluster_to_type:
-                entity = filtered_entities[node_id]
-                entity_to_type[entity.id] = cluster_to_type[cluster_id]
+        # Run clustering within each base type group
+        for base_type, type_entities in entities_by_type.items():
+            if len(type_entities) < self.min_cluster_size:
+                continue
 
-        return schemas, entity_to_type
+            # Build similarity graph for this type group
+            graph, filtered_entities, embeddings_norm = self._build_similarity_graph(
+                type_entities
+            )
+
+            # Run leiden clustering
+            partition = self._run_leiden_clustering(graph)
+
+            # Analyze clusters (pass embeddings to avoid recomputing)
+            schemas = self._analyze_clusters(
+                filtered_entities, partition, embeddings_norm
+            )
+
+            # Create entity to type mapping BEFORE modifying cluster IDs
+            cluster_to_type = {s.cluster_id: s.type_name for s in schemas}
+            for node_id in range(len(filtered_entities)):
+                cluster_id = partition[node_id]
+                if cluster_id in cluster_to_type:
+                    entity = filtered_entities[node_id]
+                    entity_to_type[entity.id] = cluster_to_type[cluster_id]
+
+            # Add to results with offset cluster IDs to avoid collisions
+            for schema in schemas:
+                schema.cluster_id = len(all_schemas) + schema.cluster_id
+                all_schemas.append(schema)
+
+        # Sort by confidence
+        all_schemas.sort(key=lambda x: x.confidence, reverse=True)
+
+        return all_schemas, entity_to_type

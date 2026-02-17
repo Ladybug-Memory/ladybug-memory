@@ -108,6 +108,20 @@ class LadybugMemory(AgentMemory):
             )
             """
         )
+        # Discovered schema types (tracks hierarchy: specific_type IS_A base_type)
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS DiscoveredSchemaType(
+                id SERIAL PRIMARY KEY,
+                type_name STRING,
+                base_type STRING,
+                confidence FLOAT,
+                sample_entities JSON,
+                entity_count INT64,
+                created_at TIMESTAMP
+            )
+            """
+        )
 
     def _init_fts_index(self) -> None:
         try:
@@ -840,6 +854,132 @@ class LadybugMemory(AgentMemory):
                 continue
 
         return table_mapping
+
+    def populate_dynamic_schema_tables(
+        self,
+        entities: list[Entity],
+        entity_to_type: dict[str, str],
+        table_mapping: dict[str, str],
+        memory_id: int | None = None,
+    ) -> dict[str, int]:
+        """Populate dynamic schema tables with entities from the generic Entity table.
+
+        Args:
+            entities: List of entities to populate
+            entity_to_type: Mapping from entity ID to discovered type name
+            table_mapping: Mapping from type name to table name
+            memory_id: Optional memory ID to link entities to
+
+        Returns:
+            Dictionary with counts of entities stored per table
+        """
+        counts: dict[str, int] = {}
+
+        for entity in entities:
+            entity_type = entity_to_type.get(str(entity.id))
+            if not entity_type:
+                continue
+
+            table_name = table_mapping.get(entity_type)
+            if not table_name:
+                continue
+
+            # Store entity in typed table
+            self._store_entity_in_typed_table(
+                entity, str(memory_id) if memory_id else "0", table_name
+            )
+            counts[table_name] = counts.get(table_name, 0) + 1
+
+        return counts
+
+    def store_schema_hierarchy(
+        self,
+        discovered_schemas: list[dict[str, Any]],
+    ) -> int:
+        """Store discovered schema types in the hierarchy table.
+
+        Args:
+            discovered_schemas: List of discovered schema dicts with type_name, base_type, etc.
+
+        Returns:
+            Number of schema types stored
+        """
+        import json
+
+        now = datetime.now()
+        count = 0
+
+        for schema in discovered_schemas:
+            type_name = schema.get("type_name", "")
+            base_type = schema.get("base_type", "unknown")
+            confidence = schema.get("confidence", 0.0)
+            sample_entities = schema.get("sample_entities", [])
+            entity_count = schema.get("size", 0)
+
+            # Skip if type_name same as base_type (no specialization)
+            if type_name.lower() == base_type.lower():
+                continue
+
+            # Check if this schema type already exists
+            check_cypher = f"""
+                MATCH (s:DiscoveredSchemaType)
+                WHERE s.type_name = '{type_name.replace("'", "''")}'
+                RETURN s.id
+            """
+            raw_result = self.conn.execute(check_cypher)
+            result = _get_result(raw_result)
+
+            if result.has_next():
+                continue  # Already exists
+
+            # Store new schema type
+            samples_json = json.dumps(sample_entities[:10])
+            create_cypher = f"""
+                CREATE (s:DiscoveredSchemaType {{
+                    type_name: '{type_name.replace("'", "''")}',
+                    base_type: '{base_type.replace("'", "''")}',
+                    confidence: {confidence},
+                    sample_entities: '{samples_json.replace("'", "''")}',
+                    entity_count: {entity_count},
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+            """
+            self.conn.execute(create_cypher)
+            count += 1
+
+        return count
+
+    def get_schema_hierarchy(self) -> list[dict[str, Any]]:
+        """Get all discovered schema types and their hierarchy.
+
+        Returns:
+            List of schema type dicts with type_name, base_type, etc.
+        """
+        import json
+
+        cypher = """
+            MATCH (s:DiscoveredSchemaType)
+            RETURN s.type_name, s.base_type, s.confidence, s.sample_entities, s.entity_count
+            ORDER BY s.base_type, s.confidence DESC
+        """
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+
+        schemas = []
+        while result.has_next():
+            row = result.get_next()
+            samples_json = row[3] if row[3] else "[]"
+            schemas.append(
+                {
+                    "type_name": row[0],
+                    "base_type": row[1],
+                    "confidence": row[2],
+                    "sample_entities": json.loads(samples_json),
+                    "entity_count": row[4],
+                }
+            )
+
+        return schemas
 
     def _sanitize_table_name(self, name: str) -> str:
         """Sanitize a schema type name for use as a table name."""
