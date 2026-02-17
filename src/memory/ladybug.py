@@ -794,7 +794,7 @@ class LadybugMemory(AgentMemory):
             confidence = schema.get("confidence", 0.0)
 
             # Only create tables for high-confidence schemas
-            if confidence < 0.6:
+            if confidence < 0.5:
                 continue
 
             # Sanitize type name for table name
