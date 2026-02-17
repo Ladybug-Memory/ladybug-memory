@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Test dynamic schema discovery with a challenging 2-page document."""
 
+import os
+
+from dotenv import load_dotenv
+
 from memory import LadybugMemory, DynamicSchemaDiscovery
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def main():
@@ -140,14 +147,15 @@ def main():
         for s in samples:
             print(f"    - {s}")
 
-    # Run schema discovery with LLM-based type naming
-    print("\nRunning dynamic schema discovery with LLM naming...")
+    # Run schema discovery (LLM optional - set LLM_MODEL in .env)
+    llm_model = os.environ.get("LLM_MODEL")
+    print(f"\nRunning dynamic schema discovery (LLM: {llm_model or 'disabled'})...")
 
     schema_discovery = DynamicSchemaDiscovery(
-        similarity_threshold=0.70,
+        similarity_threshold=0.60,
         min_cluster_size=2,
-        min_confidence=0.50,
-        llm_model="ollama/granite4:tiny-h",  # Use local Ollama with granite4:tiny-h
+        min_confidence=0.45,
+        llm_model=llm_model,
     )
 
     discovered_schemas, entity_to_type = schema_discovery.discover_schema(entities)
@@ -155,7 +163,7 @@ def main():
     print(f"\nDiscovered {len(discovered_schemas)} entity clusters:")
     for schema in discovered_schemas:
         print(
-            f"\n  {schema.type_name.upper()} (confidence: {schema.confidence:.2f}, size: {schema.size})"
+            f"\n  {schema.type_name} (base: {schema.base_type}, confidence: {schema.confidence:.2f}, size: {schema.size})"
         )
         print(f"  Samples: {', '.join(schema.sample_entities[:6])}")
 
@@ -163,6 +171,7 @@ def main():
     schema_dicts = [
         {
             "type_name": s.type_name,
+            "base_type": s.base_type,
             "confidence": s.confidence,
             "sample_entities": s.sample_entities,
             "cluster_id": s.cluster_id,
@@ -176,6 +185,32 @@ def main():
     print(f"\nCreated {len(table_mapping)} dynamic tables:")
     for type_name, table_name in table_mapping.items():
         print(f"  - {type_name} -> {table_name}")
+
+    # Store schema hierarchy
+    print("\nStoring schema hierarchy...")
+    hierarchy_count = memory.store_schema_hierarchy(schema_dicts)
+    print(f"  Stored {hierarchy_count} schema type hierarchies")
+
+    # Populate the dynamic tables with entities
+    print("\nPopulating dynamic tables with entities...")
+    counts = memory.populate_dynamic_schema_tables(
+        entities=entities,
+        entity_to_type=entity_to_type,
+        table_mapping=table_mapping,
+        memory_id=entry.id,
+    )
+
+    print(f"Entities moved to typed tables:")
+    for table_name, count in sorted(counts.items()):
+        print(f"  - {table_name}: {count} entities")
+
+    # Show schema hierarchy
+    print("\nSchema Hierarchy (IS_A relationships):")
+    hierarchy = memory.get_schema_hierarchy()
+    for h in hierarchy:
+        print(
+            f"  - {h['type_name']} IS_A {h['base_type']} ({h['entity_count']} entities)"
+        )
 
     print("\n" + "=" * 60)
     print("Knowledge graph extraction completed!")
