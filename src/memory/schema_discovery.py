@@ -25,6 +25,55 @@ from memory.entities import Entity
 _arrow_registry = {}
 
 
+def _generate_type_name_with_llm(
+    entities: list[str], base_type: str, model: str = "gpt-4o-mini"
+) -> str:
+    """Use LLM to generate a descriptive type name for a cluster of entities."""
+    try:
+        import os
+        from litellm import completion
+
+        entity_list = ", ".join(entities[:15])
+        prompt = f"""Given these entities of type "{base_type}": {entity_list}
+
+Generate a specific, descriptive type name (2-3 words max, PascalCase) that best describes this group.
+Examples:
+- "Tim Cook, Sundar Pichai, Elon Musk" -> "Tech Executive"
+- "Apple Inc., Microsoft, Google" -> "Tech Company"
+- "Stanford, MIT, Harvard" -> "University"
+- "London, Tokyo, Boston" -> "City"
+- "Pfizer, Moderna, Novartis" -> "Pharmaceutical Company"
+
+Respond with ONLY the type name, no explanation."""
+
+        # Handle Ollama API base URL (strip trailing slash)
+        kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 20,
+            "temperature": 0.3,
+        }
+
+        if model.startswith("ollama/"):
+            ollama_base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+            kwargs["api_base"] = ollama_base.rstrip("/")
+
+        response = completion(**kwargs)
+
+        type_name = response.choices[0].message.content.strip()
+        # Clean up - remove quotes, extra whitespace
+        type_name = type_name.strip("\"'").strip()
+        # Ensure PascalCase (capitalize each word)
+        type_name = "".join(
+            word.capitalize() for word in type_name.replace("_", " ").split()
+        )
+        return type_name
+
+    except Exception:
+        # Fallback to base type if LLM fails
+        return base_type.capitalize()
+
+
 @dataclass
 class DiscoveredSchema:
     """A discovered schema type from clustering."""
@@ -53,6 +102,7 @@ class DynamicSchemaDiscovery:
         similarity_threshold: float = 0.75,
         min_cluster_size: int = 3,
         min_confidence: float = 0.7,
+        llm_model: str | None = "gpt-4o-mini",
     ):
         """Initialize dynamic schema discovery.
 
@@ -60,10 +110,13 @@ class DynamicSchemaDiscovery:
             similarity_threshold: Minimum cosine similarity to create edge
             min_cluster_size: Minimum entities in a cluster to be a schema type
             min_confidence: Minimum confidence for discovered schema
+            llm_model: LiteLLM model name for generating descriptive type names.
+                       Set to None to disable LLM and use base entity types.
         """
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
         self.min_confidence = min_confidence
+        self.llm_model = llm_model
         self._embedding_model: TextEmbedding | None = None
 
     def _init_embedding_model(self) -> None:
@@ -80,16 +133,16 @@ class DynamicSchemaDiscovery:
 
     def _build_similarity_graph(
         self, entities: list[Entity]
-    ) -> tuple[nk.Graph, list[Entity]]:
+    ) -> tuple[nk.Graph, list[Entity], np.ndarray]:
         """Build entity similarity graph using embeddings.
 
         Returns:
-            Tuple of (networkit graph, filtered entity list)
+            Tuple of (networkit graph, filtered entity list, normalized embeddings)
         """
         if len(entities) < 2:
             # Create empty graph with single node if only one entity
             graph = nk.Graph(1)
-            return graph, entities
+            return graph, entities, np.array([])
 
         # Get embeddings
         embeddings = self._get_embeddings(entities)
@@ -115,7 +168,7 @@ class DynamicSchemaDiscovery:
         if len(sources) == 0:
             # No edges above threshold, create graph with just nodes
             graph = nk.Graph(len(entities))
-            return graph, entities
+            return graph, entities, embeddings_norm
 
         # Remap node IDs to consecutive integers (CSR requires 0 to n-1)
         # IMPORTANT: Map ALL entity indices (0 to len(entities)-1) to ensure partition aligns
@@ -162,7 +215,7 @@ class DynamicSchemaDiscovery:
             "indptr": indptr_arrow,
         }
 
-        return graph, entities
+        return graph, entities, embeddings_norm
 
     def _run_leiden_clustering(self, graph: nk.Graph):
         """Run parallel leiden clustering on entity graph.
@@ -174,8 +227,9 @@ class DynamicSchemaDiscovery:
             Partition object with cluster assignments
         """
         # Create ParallelLeidenView instance
+        # Use minimal iterations for speed
         leiden = nk.community.ParallelLeidenView(
-            graph, iterations=3, randomize=True, gamma=1.0
+            graph, iterations=1, randomize=False, gamma=0.5
         )
 
         # Run clustering
@@ -190,39 +244,42 @@ class DynamicSchemaDiscovery:
         self,
         entities: list[Entity],
         partition,
+        all_embeddings: np.ndarray,
     ) -> list[DiscoveredSchema]:
         """Analyze clusters to discover schema types.
 
         Args:
             entities: List of entities
             partition: Cluster partition from leiden
+            all_embeddings: Pre-computed normalized embeddings
 
         Returns:
             List of discovered schemas
         """
         discovered_schemas = []
 
-        # Group entities by cluster
-        cluster_entities: dict[int, list[Entity]] = {}
+        # Group entities by cluster (store indices for embedding lookup)
+        cluster_entities: dict[int, list[tuple[int, Entity]]] = {}
         for node_id in range(len(entities)):
             cluster_id = partition[node_id]
             if cluster_id not in cluster_entities:
                 cluster_entities[cluster_id] = []
-            cluster_entities[cluster_id].append(entities[node_id])
+            cluster_entities[cluster_id].append((node_id, entities[node_id]))
 
         # Analyze each cluster
-        for cluster_id, cluster_ents in cluster_entities.items():
-            if len(cluster_ents) < self.min_cluster_size:
+        for cluster_id, cluster_items in cluster_entities.items():
+            if len(cluster_items) < self.min_cluster_size:
                 continue
 
+            # Extract just entities for type inference
+            cluster_ents = [e for _, e in cluster_items]
+
             # Calculate confidence based on cluster cohesion
-            # (average similarity within cluster)
-            if len(cluster_ents) > 1:
-                embeddings = self._get_embeddings(cluster_ents)
-                embeddings_norm = embeddings / np.linalg.norm(
-                    embeddings, axis=1, keepdims=True
-                )
-                similarity_matrix = np.dot(embeddings_norm, embeddings_norm.T)
+            if len(cluster_items) > 1 and len(all_embeddings) > 0:
+                # Get embeddings for this cluster using original indices
+                indices = [idx for idx, _ in cluster_items]
+                cluster_embs = all_embeddings[indices]
+                similarity_matrix = np.dot(cluster_embs, cluster_embs.T)
                 # Get upper triangle (excluding diagonal)
                 similarities = similarity_matrix[
                     np.triu_indices_from(similarity_matrix, k=1)
@@ -234,7 +291,7 @@ class DynamicSchemaDiscovery:
             if confidence < self.min_confidence:
                 continue
 
-            # Infer type name from most common words in entity texts
+            # Infer type name from GLiNER2 entity types
             sample_texts = [e.text for e in cluster_ents[:5]]
             type_name = self._infer_type_name(cluster_ents)
 
@@ -254,78 +311,24 @@ class DynamicSchemaDiscovery:
         return discovered_schemas
 
     def _infer_type_name(self, entities: list[Entity]) -> str:
-        """Infer a type name from cluster entities.
+        """Infer a descriptive type name from cluster entities.
 
-        Uses heuristics based on entity text patterns.
+        Uses LLM to generate a specific type name based on the entities.
+        Falls back to the GLiNER2 entity_type if LLM is disabled or fails.
         """
-        # Get all entity texts
-        texts = [e.text.lower() for e in entities]
+        from collections import Counter
 
-        # Check for common patterns
-        # Person names (typically 2-3 capitalized words)
-        person_pattern = sum(
-            1
-            for t in texts
-            if len(t.split()) in [1, 2] and all(c.isalpha() or c.isspace() for c in t)
-        )
+        # Get base type from GLiNER2
+        type_counts = Counter([e.entity_type for e in entities])
+        base_type = type_counts.most_common(1)[0][0] if type_counts else "unknown"
 
-        # Locations (contain location indicators)
-        location_indicators = [
-            "city",
-            "state",
-            "country",
-            "street",
-            "avenue",
-            "road",
-            "blvd",
-        ]
-        location_pattern = sum(
-            1 for t in texts for ind in location_indicators if ind in t
-        )
+        # If LLM is enabled, generate a descriptive name
+        if self.llm_model:
+            entity_texts = [e.text for e in entities[:20]]
+            return _generate_type_name_with_llm(entity_texts, base_type, self.llm_model)
 
-        # Organizations (common suffixes)
-        org_suffixes = ["inc", "corp", "llc", "ltd", "company", "co.", "gmbh"]
-        org_pattern = sum(1 for t in texts for suffix in org_suffixes if suffix in t)
-
-        # Dates (numbers with separators)
-        date_pattern = sum(
-            1
-            for t in texts
-            if any(c.isdigit() for c in t) and any(c in t for c in ["/", "-", ".", ","])
-        )
-
-        # Products (often contain version numbers or proper nouns)
-        product_pattern = sum(
-            1 for t in texts if any(c.isdigit() for c in t) and len(t.split()) <= 3
-        )
-
-        # Find best match
-        patterns = {
-            "person": person_pattern,
-            "location": location_pattern,
-            "organization": org_pattern,
-            "date": date_pattern,
-            "product": product_pattern,
-        }
-
-        best_type = max(patterns.items(), key=lambda x: x[1])[0]
-
-        # If no strong pattern, use generic name based on most common words
-        if patterns[best_type] == 0:
-            # Extract words and find most common
-            words = []
-            for t in texts:
-                words.extend(t.split())
-
-            if words:
-                from collections import Counter
-
-                most_common = Counter(words).most_common(1)[0][0]
-                return f"{most_common}_entity"
-            else:
-                return f"entity_type_{uuid.uuid4().hex[:8]}"
-
-        return best_type
+        # Fallback: use capitalized base type
+        return base_type.capitalize()
 
     def discover_schema(
         self, entities: list[Entity]
@@ -342,13 +345,15 @@ class DynamicSchemaDiscovery:
             return [], {}
 
         # Build similarity graph
-        graph, filtered_entities = self._build_similarity_graph(entities)
+        graph, filtered_entities, embeddings_norm = self._build_similarity_graph(
+            entities
+        )
 
         # Run leiden clustering
         partition = self._run_leiden_clustering(graph)
 
-        # Analyze clusters
-        schemas = self._analyze_clusters(filtered_entities, partition)
+        # Analyze clusters (pass embeddings to avoid recomputing)
+        schemas = self._analyze_clusters(filtered_entities, partition, embeddings_norm)
 
         # Create entity to type mapping
         entity_to_type: dict[str, str] = {}
