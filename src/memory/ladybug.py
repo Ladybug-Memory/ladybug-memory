@@ -66,7 +66,9 @@ class LadybugMemory(AgentMemory):
             """
             CREATE REL TABLE IF NOT EXISTS MemoryLink(
                 FROM Memory TO Memory,
-                relation STRING
+                relation STRING,
+                start_timestamp TIMESTAMP DEFAULT current_timestamp(),
+                end_timestamp TIMESTAMP DEFAULT current_timestamp()
             )
             """
         )
@@ -117,31 +119,11 @@ class LadybugMemory(AgentMemory):
                 FROM Entity TO Entity,
                 relation_type STRING,
                 confidence FLOAT,
-                metadata JSON
-            )
-            """
-        )
-        # Relations edges (extracted relations between entities)
-        self.conn.execute(
-            """
-            CREATE REL TABLE IF NOT EXISTS Relations(
-                FROM Entity TO Entity,
-                relation_type STRING,
-                confidence FLOAT,
-                metadata JSON
-            )
-            """
-        )
-        # Relations edges (extracted relations between entities)
-        self.conn.execute(
-            """
-            CREATE REL TABLE IF NOT EXISTS Relations(
-                FROM Entity TO Entity,
-                relation_type STRING,
-                confidence FLOAT,
                 source_text STRING,
                 target_text STRING,
-                metadata JSON
+                metadata JSON,
+                start_timestamp TIMESTAMP DEFAULT current_timestamp(),
+                end_timestamp TIMESTAMP DEFAULT current_timestamp()
             )
             """
         )
@@ -511,11 +493,19 @@ class LadybugMemory(AgentMemory):
         source_id: str,
         target_id: str,
         relation: str = "related",
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
     ) -> bool:
+        start_ts = start_timestamp or datetime.now()
+        end_ts = end_timestamp or datetime.now()
         cypher = f"""
             MATCH (a:Memory), (b:Memory)
             WHERE a.id = {source_id} AND b.id = {target_id}
-            CREATE (a)-[r:MemoryLink {{relation: '{relation}'}}]->(b)
+            CREATE (a)-[r:MemoryLink {{
+                relation: '{relation}',
+                start_timestamp: timestamp('{start_ts.strftime("%Y-%m-%d %H:%M:%S")}'),
+                end_timestamp: timestamp('{end_ts.strftime("%Y-%m-%d %H:%M:%S")}')
+            }}]->(b)
         """
 
         self.conn.execute(cypher)
@@ -739,8 +729,17 @@ class LadybugMemory(AgentMemory):
             parameters=mention_params,
         )
 
-    def _store_relations(self, relations: list) -> None:
+    def _store_relations(
+        self,
+        relations: list,
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
+    ) -> None:
         import json
+
+        now = datetime.now()
+        start_ts = start_timestamp or now
+        end_ts = end_timestamp or now
 
         for rel in relations:
             source_embedding = self._get_embedding(rel.source_text)
@@ -784,12 +783,22 @@ class LadybugMemory(AgentMemory):
             if target_score < 0.85:
                 continue
 
+            rel_start = start_ts
+            rel_end = end_ts
+            if rel.metadata and isinstance(rel.metadata, dict):
+                if "start_timestamp" in rel.metadata:
+                    rel_start = rel.metadata["start_timestamp"]
+                if "end_timestamp" in rel.metadata:
+                    rel_end = rel.metadata["end_timestamp"]
+
             rel_params = {
                 "source_id": int(source_id),
                 "target_id": int(target_id),
                 "relation_type": rel.relation_type,
                 "confidence": rel.confidence,
                 "metadata": json.dumps(rel.metadata) if rel.metadata else None,
+                "start_timestamp": rel_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_timestamp": rel_end.strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.conn.execute(
                 """
@@ -798,7 +807,9 @@ class LadybugMemory(AgentMemory):
                 CREATE (s)-[r:Relations {
                     relation_type: $relation_type,
                     confidence: $confidence,
-                    metadata: $metadata
+                    metadata: $metadata,
+                    start_timestamp: timestamp($start_timestamp),
+                    end_timestamp: timestamp($end_timestamp)
                 }]->(t)
                 """,
                 parameters=rel_params,
