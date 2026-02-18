@@ -145,7 +145,10 @@ class LadybugMemory(AgentMemory):
         if not hasattr(self, "_embedding_model"):
             self._init_embedding_model()
         embeddings = list(self._embedding_model.embed([text]))
-        return embeddings[0]
+        emb = embeddings[0]
+        if hasattr(emb, "tolist"):
+            return emb.tolist()
+        return list(emb)
 
     def _init_vector_search(self) -> None:
         try:
@@ -193,21 +196,19 @@ class LadybugMemory(AgentMemory):
         now = datetime.now()
         embedding = self._get_embedding(content)
 
-        # Prepare parameters for the query
         parameters = {
             "content": content,
             "memory_type": memory_type,
             "importance": importance,
-            "embedding": embedding.tolist()
-            if hasattr(embedding, "tolist")
-            else embedding,
+            "embedding": embedding,
             "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
             "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        # Handle metadata as JSON if provided
         if metadata:
-            parameters["metadata"] = str(metadata)
+            import json
+
+            parameters["metadata"] = json.dumps(metadata)
             raw_result = self.conn.execute(
                 """
                 CREATE (m:Memory {
@@ -565,7 +566,7 @@ class LadybugMemory(AgentMemory):
 
         return entry, entities
 
-    def _store_entity_mention(self, entity: Entity, memory_id: str) -> None:
+    def _store_entity_mention(self, entity: Entity, memory_id: str | int) -> None:
         """Store an entity mention and link it to a memory.
 
         Args:
@@ -573,55 +574,75 @@ class LadybugMemory(AgentMemory):
             memory_id: The ID of the memory containing the entity
         """
         now = datetime.now()
+        memory_id_str = str(memory_id)
 
-        # Check if entity already exists (by canonical name + type)
-        check_cypher = f"""
+        check_params = {
+            "canonical_name": entity.text,
+            "entity_type": entity.entity_type,
+        }
+        raw_result = self.conn.execute(
+            """
             MATCH (e:Entity)
-            WHERE e.canonical_name = '{entity.text.replace("'", "''")}'
-            AND e.entity_type = '{entity.entity_type}'
+            WHERE e.canonical_name = $canonical_name
+            AND e.entity_type = $entity_type
             RETURN e.id
-        """
-        raw_result = self.conn.execute(check_cypher)
+            """,
+            parameters=check_params,
+        )
         result = _get_result(raw_result)
 
         entity_id: str
         if result.has_next():
-            # Entity exists, use existing ID
             row = result.get_next()
             entity_id = str(row[0])
         else:
-            # Create new entity
             embedding = self._get_embedding(entity.text)
-            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-            create_cypher = f"""
-                CREATE (e:Entity {{
-                    canonical_name: '{entity.text.replace("'", "''")}',
-                    entity_type: '{entity.entity_type}',
-                    embedding: {embedding_str},
+            create_params = {
+                "canonical_name": entity.text,
+                "entity_type": entity.entity_type,
+                "embedding": embedding,
+                "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            raw_result = self.conn.execute(
+                """
+                CREATE (e:Entity {
+                    canonical_name: $canonical_name,
+                    entity_type: $entity_type,
+                    embedding: $embedding,
                     metadata: NULL,
-                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
-                    updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
-                }})
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
                 RETURN e.id
-            """
-            raw_result = self.conn.execute(create_cypher)
+                """,
+                parameters=create_params,
+            )
             result = _get_result(raw_result)
             row = result.get_next()
             entity_id = str(row[0])
 
-        # Create mention relationship
-        mention_cypher = f"""
+        mention_params = {
+            "entity_id": int(entity_id),
+            "memory_id": int(memory_id_str),
+            "mention_text": entity.text,
+            "confidence": entity.confidence,
+            "span_start": entity.start_pos,
+            "span_end": entity.end_pos,
+        }
+        self.conn.execute(
+            """
             MATCH (e:Entity), (m:Memory)
-            WHERE e.id = {entity_id} AND m.id = {memory_id}
-            CREATE (e)-[r:MentionedIn {{
-                mention_text: '{entity.text.replace("'", "''")}',
-                confidence: {entity.confidence},
-                span_start: {entity.start_pos},
-                span_end: {entity.end_pos}
-            }}]->(m)
-        """
-        self.conn.execute(mention_cypher)
+            WHERE e.id = $entity_id AND m.id = $memory_id
+            CREATE (e)-[r:MentionedIn {
+                mention_text: $mention_text,
+                confidence: $confidence,
+                span_start: $span_start,
+                span_end: $span_end
+            }]->(m)
+            """,
+            parameters=mention_params,
+        )
 
     def search_by_entity(
         self,
@@ -916,35 +937,45 @@ class LadybugMemory(AgentMemory):
             sample_entities = schema.get("sample_entities", [])
             entity_count = schema.get("size", 0)
 
-            # Skip if type_name same as base_type (no specialization)
             if type_name.lower() == base_type.lower():
                 continue
 
-            # Check if this schema type already exists
-            check_cypher = f"""
+            check_params = {"type_name": type_name}
+            raw_result = self.conn.execute(
+                """
                 MATCH (s:DiscoveredSchemaType)
-                WHERE s.type_name = '{type_name.replace("'", "''")}'
+                WHERE s.type_name = $type_name
                 RETURN s.id
-            """
-            raw_result = self.conn.execute(check_cypher)
+                """,
+                parameters=check_params,
+            )
             result = _get_result(raw_result)
 
             if result.has_next():
-                continue  # Already exists
+                continue
 
-            # Store new schema type
             samples_json = json.dumps(sample_entities[:10])
-            create_cypher = f"""
-                CREATE (s:DiscoveredSchemaType {{
-                    type_name: '{type_name.replace("'", "''")}',
-                    base_type: '{base_type.replace("'", "''")}',
-                    confidence: {confidence},
-                    sample_entities: '{samples_json.replace("'", "''")}',
-                    entity_count: {entity_count},
-                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
-                }})
-            """
-            self.conn.execute(create_cypher)
+            create_params = {
+                "type_name": type_name,
+                "base_type": base_type,
+                "confidence": confidence,
+                "sample_entities": samples_json,
+                "entity_count": entity_count,
+                "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.conn.execute(
+                """
+                CREATE (s:DiscoveredSchemaType {
+                    type_name: $type_name,
+                    base_type: $base_type,
+                    confidence: $confidence,
+                    sample_entities: CAST($sample_entities AS JSON),
+                    entity_count: $entity_count,
+                    created_at: timestamp($created_at)
+                })
+                """,
+                parameters=create_params,
+            )
             count += 1
 
         return count
