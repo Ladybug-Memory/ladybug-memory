@@ -9,12 +9,101 @@ from typing import Any
 class Entity:
     """Represents an extracted entity mention."""
 
-    id: int | None
+    id: str | None
     text: str
     entity_type: str
     confidence: float
     start_pos: int
     end_pos: int
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class DocumentEntity:
+    """Represents an extracted document with structured subfields."""
+
+    id: str | None
+    text: str
+    confidence: float
+    start_pos: int
+    end_pos: int
+    title: str | None = None
+    author: str | None = None
+    date: str | None = None
+    url: str | None = None
+    doc_type: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class MoneyEntity:
+    """Represents a monetary value with currency and amount."""
+
+    id: str | None
+    text: str
+    confidence: float
+    start_pos: int
+    end_pos: int
+    amount: float | None = None
+    currency: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class NumberEntity:
+    """Represents a numeric value."""
+
+    id: str | None
+    text: str
+    confidence: float
+    start_pos: int
+    end_pos: int
+    value: float | None = None
+    unit: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class FractionEntity:
+    """Represents a fractional value."""
+
+    id: str | None
+    text: str
+    confidence: float
+    start_pos: int
+    end_pos: int
+    numerator: float | None = None
+    denominator: float | None = None
+    decimal_value: float | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class PercentageEntity:
+    """Represents a percentage value."""
+
+    id: str | None
+    text: str
+    confidence: float
+    start_pos: int
+    end_pos: int
+    value: float | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class Relation:
+    """Represents an extracted relation between entities."""
+
+    id: str | None
+    relation_type: str
+    source_text: str
+    target_text: str
+    source_start: int
+    source_end: int
+    target_start: int
+    target_end: int
+    confidence: float
     metadata: dict[str, Any] | None = None
 
 
