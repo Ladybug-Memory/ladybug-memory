@@ -4,6 +4,7 @@ from typing import Any, cast
 import real_ladybug as lb
 from fastembed import TextEmbedding
 
+from memory.chunker import LogicalChunker
 from memory.entities import Entity
 from memory.extraction import GLiNEREntityExtractor
 from memory.interface import (
@@ -574,8 +575,11 @@ class LadybugMemory(AgentMemory):
         importance: int = 5,
         metadata: dict[str, Any] | None = None,
         extract_entities: bool = True,
-    ) -> tuple[MemoryEntry, list[Entity]]:
+    ) -> tuple[MemoryEntry, list[Entity], int]:
         """Store memory and optionally extract/link entities and relations.
+
+        Uses H-GLUE logical chunking to improve relation extraction by
+        processing semantically coherent units rather than entire documents.
 
         Args:
             content: The memory content
@@ -585,32 +589,42 @@ class LadybugMemory(AgentMemory):
             extract_entities: Whether to extract and link entities
 
         Returns:
-            Tuple of (MemoryEntry, list of extracted entities, int relations_count)
+            Tuple of (MemoryEntry, list of extracted entities, relations_count)
         """
         entry = self.store(content, memory_type, importance, metadata)
 
         entities: list[Entity] = []
         relations_count = 0
         if extract_entities and self._entity_extractor:
-            result = self._entity_extractor.extract_all(content)
-            extracted_entities = result.get("entities", [])
-            relations = result.get("relations", [])
-            relations_count = len(relations)
+            chunker = LogicalChunker()
+            units = chunker.chunk(content)
 
-            for ext in extracted_entities:
-                entity = Entity(
-                    id=None,
-                    text=ext.text,
-                    entity_type=ext.entity_type,
-                    confidence=ext.confidence,
-                    start_pos=ext.start_pos,
-                    end_pos=ext.end_pos,
-                    metadata=ext.metadata,
-                )
+            all_entities: dict[tuple[str, str], Entity] = {}
+            all_relations: list[Any] = []
+
+            for unit in units:
+                result = self._entity_extractor.extract_all(unit.text)
+                for ext in result.get("entities", []):
+                    key = (ext.text, ext.entity_type)
+                    if key not in all_entities:
+                        all_entities[key] = Entity(
+                            id=None,
+                            text=ext.text,
+                            entity_type=ext.entity_type,
+                            confidence=ext.confidence,
+                            start_pos=ext.start_pos + unit.start,
+                            end_pos=ext.end_pos + unit.start,
+                            metadata=ext.metadata,
+                        )
+                all_relations.extend(result.get("relations", []))
+
+            entities = list(all_entities.values())
+            relations_count = len(all_relations)
+
+            for entity in entities:
                 self._store_entity_mention(entity, entry.id)
-                entities.append(entity)
 
-            self._store_relations(relations)
+            self._store_relations(all_relations)
 
         return entry, entities, relations_count
 
