@@ -49,11 +49,6 @@ class GLiNEREntityExtractor:
         "date",
         "technology",
         "concept",
-        "money",
-        "number",
-        "fraction",
-        "percentage",
-        "document",
     ]
 
     def __init__(
@@ -61,17 +56,12 @@ class GLiNEREntityExtractor:
         model_name: str = "fastino/gliner2-base-v1",
         confidence_threshold: float = 0.85,
         labels: list[str] | None = None,
+        relations: list[str] | None = None,
     ):
-        """Initialize the GLiNER2 extractor.
-
-        Args:
-            model_name: HuggingFace model name for GLiNER2
-            confidence_threshold: Minimum confidence for entity acceptance
-            labels: List of entity labels to extract (uses defaults if None)
-        """
         self.model = GLiNER2.from_pretrained(model_name)
         self.confidence_threshold = confidence_threshold
         self.labels = labels or self.DEFAULT_LABELS
+        self.relations = relations or SCHEMA_ORG_RELATIONS
 
     def extract(
         self,
@@ -79,27 +69,13 @@ class GLiNEREntityExtractor:
         labels: list[str] | None = None,
         threshold: float | None = None,
     ) -> list[ExtractedEntity]:
-        """Extract entities from text.
-
-        Args:
-            text: The text to extract entities from
-            labels: Override default labels for this extraction
-            threshold: Override default threshold for this extraction
-
-        Returns:
-            List of extracted entities
-        """
         use_labels = labels or self.labels
         use_threshold = (
             threshold if threshold is not None else self.confidence_threshold
         )
 
-        result = self.model.extract_entities(
-            text,
-            use_labels,
-            include_confidence=True,
-            include_spans=True,
-        )
+        schema = self.model.create_schema().entities(use_labels)
+        result = self.model.extract(text, schema)
 
         entities = []
         for entity_type, entity_list in result.get("entities", {}).items():
@@ -135,17 +111,6 @@ class GLiNEREntityExtractor:
         labels: list[str] | None = None,
         threshold: float | None = None,
     ) -> list[Entity]:
-        """Extract entities with context metadata.
-
-        Args:
-            text: The text to extract entities from
-            context: Additional context (e.g., document_title, section_title)
-            labels: Override default labels
-            threshold: Override default threshold
-
-        Returns:
-            List of entities with unique IDs and metadata
-        """
         extracted = self.extract(text, labels, threshold)
 
         entities = []
@@ -175,42 +140,37 @@ class GLiNEREntityExtractor:
         self,
         text: str,
         labels: list[str] | None = None,
+        relations: list[str] | None = None,
         threshold: float | None = None,
     ) -> dict[str, Any]:
-        """Extract all entities and relations from text in a single GLiNER2 call.
-
-        Args:
-            text: The text to extract from
-            labels: Entity labels to extract (adds schema.org relations automatically)
-            threshold: Confidence threshold
-
-        Returns:
-            Dictionary with 'entities' and 'relations' keys
-        """
+        """Extract entities, relations, and structured data in a single GLiNER2 call."""
         use_threshold = (
             threshold if threshold is not None else self.confidence_threshold
         )
-        use_labels = list(labels) if labels else list(self.labels)
+        use_labels = labels or self.labels
+        use_relations = relations or self.relations
 
-        for rel in SCHEMA_ORG_RELATIONS:
-            if rel not in use_labels:
-                use_labels.append(rel)
-
-        result = self.model.extract_entities(
-            text,
-            use_labels,
-            include_confidence=True,
-            include_spans=True,
+        schema = (
+            self.model.create_schema()
+            .entities(use_labels)
+            .relations(use_relations)
+            .structure("money")
+            .field("amount", dtype="str")
+            .field("currency", dtype="str")
+            .structure("number")
+            .field("value", dtype="str")
+            .field("unit", dtype="str")
+            .structure("fraction")
+            .field("value", dtype="str")
+            .structure("percentage")
+            .field("value", dtype="str")
         )
 
-        entities_data = result.get("entities", {})
-
-        entity_types = set(labels) if labels else set(self.labels)
-        entity_types = entity_types - set(SCHEMA_ORG_RELATIONS)
+        result = self.model.extract(text, schema, threshold=use_threshold)
 
         entities: list[ExtractedEntity] = []
-        for entity_type in entity_types:
-            for entity_data in entities_data.get(entity_type, []):
+        for entity_type, entity_list in result.get("entities", {}).items():
+            for entity_data in entity_list:
                 if isinstance(entity_data, str):
                     continue
                 confidence = entity_data.get("confidence", 0.0)
@@ -226,36 +186,42 @@ class GLiNEREntityExtractor:
                     )
 
         relations: list[Relation] = []
-        if len(entities) >= 2:
-            for rel_type in SCHEMA_ORG_RELATIONS:
-                for entity_data in entities_data.get(rel_type, []):
-                    if isinstance(entity_data, str):
-                        continue
-                    confidence = entity_data.get("confidence", 0.0)
-                    if confidence < use_threshold:
-                        continue
-
-                    rel_start = entity_data.get("start", 0)
-                    rel_end = entity_data.get("end", 0)
-
-                    source_entity = self._find_nearest_entity(
-                        entities, rel_start, before=True
+        for rel_type, rel_list in result.get("relation_extraction", {}).items():
+            for rel_data in rel_list:
+                if isinstance(rel_data, tuple):
+                    head_text, tail_text = rel_data
+                    relations.append(
+                        Relation(
+                            id=None,
+                            relation_type=rel_type,
+                            source_text=head_text,
+                            target_text=tail_text,
+                            source_start=0,
+                            source_end=0,
+                            target_start=0,
+                            target_end=0,
+                            confidence=1.0,
+                            metadata={
+                                "extractor": "gliner2",
+                                "relation_schema": "schema.org",
+                            },
+                        )
                     )
-                    target_entity = self._find_nearest_entity(
-                        entities, rel_end, before=False
-                    )
-
-                    if source_entity and target_entity:
+                elif isinstance(rel_data, dict):
+                    head = rel_data.get("head", {})
+                    tail = rel_data.get("tail", {})
+                    confidence = rel_data.get("confidence", head.get("confidence", 1.0))
+                    if confidence >= use_threshold:
                         relations.append(
                             Relation(
                                 id=None,
                                 relation_type=rel_type,
-                                source_text=source_entity.text,
-                                target_text=target_entity.text,
-                                source_start=source_entity.start_pos,
-                                source_end=source_entity.end_pos,
-                                target_start=target_entity.start_pos,
-                                target_end=target_entity.end_pos,
+                                source_text=head.get("text", ""),
+                                target_text=tail.get("text", ""),
+                                source_start=head.get("start", 0),
+                                source_end=head.get("end", 0),
+                                target_start=tail.get("start", 0),
+                                target_end=tail.get("end", 0),
                                 confidence=confidence,
                                 metadata={
                                     "extractor": "gliner2",
@@ -264,37 +230,27 @@ class GLiNEREntityExtractor:
                             )
                         )
 
-        return {"entities": entities, "relations": relations}
+        structured: dict[str, list[dict[str, Any]]] = {
+            "money": [],
+            "number": [],
+            "fraction": [],
+            "percentage": [],
+        }
 
-    def _find_nearest_entity(
-        self,
-        entities: list[ExtractedEntity],
-        position: int,
-        before: bool = True,
-    ) -> ExtractedEntity | None:
-        """Find the nearest entity to a position."""
-        nearest = None
-        min_distance = float("inf")
+        for struct_type in ["money", "number", "fraction", "percentage"]:
+            for item in result.get(struct_type, []):
+                if isinstance(item, dict) and item:
+                    structured[struct_type].append(item)
 
-        for entity in entities:
-            if before:
-                if entity.end_pos <= position:
-                    distance = position - entity.end_pos
-                    if distance < min_distance:
-                        min_distance = distance
-                        nearest = entity
-            else:
-                if entity.start_pos >= position:
-                    distance = entity.start_pos - position
-                    if distance < min_distance:
-                        min_distance = distance
-                        nearest = entity
-
-        return nearest
+        return {
+            "entities": entities,
+            "relations": relations,
+            "structured": structured,
+        }
 
 
 class AdaptiveEntityExtractor:
-    """Two-tier extractor: GLiNER2 primary + optional LLM fallback for complex cases."""
+    """Two-tier extractor: GLiNER2 primary + optional LLM fallback."""
 
     def __init__(
         self,
@@ -302,13 +258,6 @@ class AdaptiveEntityExtractor:
         llm_client: Any | None = None,
         enable_llm_fallback: bool = False,
     ):
-        """Initialize adaptive extractor.
-
-        Args:
-            gliner_extractor: GLiNER2 extractor instance (creates default if None)
-            llm_client: LLM client for fallback extraction (e.g., OpenAI client)
-            enable_llm_fallback: Whether to use LLM for low-confidence extractions
-        """
         self.gliner = gliner_extractor or GLiNEREntityExtractor()
         self.llm_client = llm_client
         self.enable_llm_fallback = enable_llm_fallback
@@ -318,7 +267,6 @@ class AdaptiveEntityExtractor:
         text: str,
         context: dict[str, Any] | None = None,
     ) -> list[Entity]:
-        """Extract entities using GLiNER2 with optional LLM fallback."""
         gliner_entities = self.gliner.extract_with_context(text, context)
 
         if not self.enable_llm_fallback or not self.llm_client:
@@ -330,7 +278,7 @@ class AdaptiveEntityExtractor:
         self,
         text: str,
         labels: list[str] | None = None,
+        relations: list[str] | None = None,
         threshold: float | None = None,
     ) -> dict[str, Any]:
-        """Extract all entity types and relations using GLiNER2."""
-        return self.gliner.extract_all(text, labels, threshold)
+        return self.gliner.extract_all(text, labels, relations, threshold)
