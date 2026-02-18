@@ -108,6 +108,41 @@ class LadybugMemory(AgentMemory):
             )
             """
         )
+        # Relations edges (extracted relations between entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Relations(
+                FROM Entity TO Entity,
+                relation_type STRING,
+                confidence FLOAT,
+                metadata JSON
+            )
+            """
+        )
+        # Relations edges (extracted relations between entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Relations(
+                FROM Entity TO Entity,
+                relation_type STRING,
+                confidence FLOAT,
+                metadata JSON
+            )
+            """
+        )
+        # Relations edges (extracted relations between entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Relations(
+                FROM Entity TO Entity,
+                relation_type STRING,
+                confidence FLOAT,
+                source_text STRING,
+                target_text STRING,
+                metadata JSON
+            )
+            """
+        )
         # Discovered schema types (tracks hierarchy: specific_type IS_A base_type)
         self.conn.execute(
             """
@@ -540,7 +575,7 @@ class LadybugMemory(AgentMemory):
         metadata: dict[str, Any] | None = None,
         extract_entities: bool = True,
     ) -> tuple[MemoryEntry, list[Entity]]:
-        """Store memory and optionally extract/link entities.
+        """Store memory and optionally extract/link entities and relations.
 
         Args:
             content: The memory content
@@ -550,21 +585,34 @@ class LadybugMemory(AgentMemory):
             extract_entities: Whether to extract and link entities
 
         Returns:
-            Tuple of (MemoryEntry, list of extracted entities)
+            Tuple of (MemoryEntry, list of extracted entities, int relations_count)
         """
-        # Store the memory first
         entry = self.store(content, memory_type, importance, metadata)
 
         entities: list[Entity] = []
+        relations_count = 0
         if extract_entities and self._entity_extractor:
-            # Extract entities
-            entities = self._entity_extractor.extract_with_context(content)
+            result = self._entity_extractor.extract_all(content)
+            extracted_entities = result.get("entities", [])
+            relations = result.get("relations", [])
+            relations_count = len(relations)
 
-            # Store entities and create mentions
-            for entity in entities:
+            for ext in extracted_entities:
+                entity = Entity(
+                    id=None,
+                    text=ext.text,
+                    entity_type=ext.entity_type,
+                    confidence=ext.confidence,
+                    start_pos=ext.start_pos,
+                    end_pos=ext.end_pos,
+                    metadata=ext.metadata,
+                )
                 self._store_entity_mention(entity, entry.id)
+                entities.append(entity)
 
-        return entry, entities
+            self._store_relations(relations)
+
+        return entry, entities, relations_count
 
     def _store_entity_mention(self, entity: Entity, memory_id: str | int) -> None:
         """Store an entity mention and link it to a memory.
@@ -643,6 +691,71 @@ class LadybugMemory(AgentMemory):
             """,
             parameters=mention_params,
         )
+
+    def _store_relations(self, relations: list) -> None:
+        import json
+
+        for rel in relations:
+            source_embedding = self._get_embedding(rel.source_text)
+            target_embedding = self._get_embedding(rel.target_text)
+
+            source_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.embedding,
+                       array_cosine_similarity(e.embedding, $query_embedding) AS score
+                ORDER BY score DESC
+                LIMIT 1
+                """,
+                parameters={"query_embedding": source_embedding},
+            )
+            res = _get_result(source_result)
+            if not res.has_next():
+                continue
+            source_row = res.get_next()
+            source_id = source_row[0]
+            source_score = source_row[3] if len(source_row) > 3 else 0.0
+            if source_score < 0.85:
+                continue
+
+            target_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.embedding,
+                       array_cosine_similarity(e.embedding, $query_embedding) AS score
+                ORDER BY score DESC
+                LIMIT 1
+                """,
+                parameters={"query_embedding": target_embedding},
+            )
+            res = _get_result(target_result)
+            if not res.has_next():
+                continue
+            target_row = res.get_next()
+            target_id = target_row[0]
+            target_score = target_row[3] if len(target_row) > 3 else 0.0
+            if target_score < 0.85:
+                continue
+
+            rel_params = {
+                "source_id": int(source_id),
+                "target_id": int(target_id),
+                "relation_type": rel.relation_type,
+                "confidence": rel.confidence,
+                "metadata": json.dumps(rel.metadata) if rel.metadata else None,
+            }
+            self.conn.execute(
+                """
+                MATCH (s:Entity), (t:Entity)
+                WHERE s.id = $source_id AND t.id = $target_id
+                CREATE (s)-[r:Relations {
+                    relation_type: $relation_type,
+                    confidence: $confidence,
+                    metadata: $metadata
+                }]->(t)
+                """,
+                parameters=rel_params,
+            )
 
     def search_by_entity(
         self,

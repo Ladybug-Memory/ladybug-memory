@@ -124,7 +124,7 @@ def main():
 
     # Store with entity extraction
     print("\nExtracting entities...")
-    entry, entities = memory.store_with_entities(
+    entry, entities, relations_count = memory.store_with_entities(
         content=content,
         memory_type="article",
         importance=9,
@@ -132,6 +132,7 @@ def main():
     )
 
     print(f"Total entities extracted: {len(entities)}")
+    print(f"Total relations extracted: {relations_count}")
 
     # Group by type
     type_counts = {}

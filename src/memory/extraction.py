@@ -166,24 +166,35 @@ class GLiNEREntityExtractor:
             .field("value", dtype="str")
         )
 
-        result = self.model.extract(text, schema, threshold=use_threshold)
+        result = self.model.extract(
+            text, schema, threshold=use_threshold, include_confidence=True
+        )
 
         entities: list[ExtractedEntity] = []
         for entity_type, entity_list in result.get("entities", {}).items():
             for entity_data in entity_list:
                 if isinstance(entity_data, str):
-                    continue
-                confidence = entity_data.get("confidence", 0.0)
-                if confidence >= use_threshold:
                     entities.append(
                         ExtractedEntity(
-                            text=entity_data.get("text", ""),
+                            text=entity_data,
                             entity_type=entity_type,
-                            confidence=confidence,
-                            start_pos=entity_data.get("start", 0),
-                            end_pos=entity_data.get("end", 0),
+                            confidence=1.0,
+                            start_pos=0,
+                            end_pos=0,
                         )
                     )
+                else:
+                    confidence = entity_data.get("confidence", 0.0)
+                    if confidence >= use_threshold:
+                        entities.append(
+                            ExtractedEntity(
+                                text=entity_data.get("text", ""),
+                                entity_type=entity_type,
+                                confidence=confidence,
+                                start_pos=entity_data.get("start", 0),
+                                end_pos=entity_data.get("end", 0),
+                            )
+                        )
 
         relations: list[Relation] = []
         for rel_type, rel_list in result.get("relation_extraction", {}).items():
