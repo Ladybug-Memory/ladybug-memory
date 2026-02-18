@@ -145,6 +145,38 @@ class LadybugMemory(AgentMemory):
             )
             """
         )
+        # Logical chunks for H-GLUE architecture
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS LogicalChunk(
+                id SERIAL PRIMARY KEY,
+                text STRING,
+                unit_type STRING,
+                span_start INT64,
+                span_end INT64,
+                embedding FLOAT[384],
+                created_at TIMESTAMP
+            )
+            """
+        )
+        # Entity to chunk relationship
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS AppearsIn(
+                FROM Entity TO LogicalChunk,
+                mention_text STRING,
+                confidence FLOAT
+            )
+            """
+        )
+        # Chunk to memory relationship
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS ChunkOf(
+                FROM LogicalChunk TO Memory
+            )
+            """
+        )
         # Discovered schema types (tracks hierarchy: specific_type IS_A base_type)
         self.conn.execute(
             """
@@ -1169,7 +1201,6 @@ class LadybugMemory(AgentMemory):
         Returns:
             Tuple of (MemoryEntry, schema discovery results)
         """
-        # Store the memory first
         entry = self.store(content, memory_type, importance, metadata)
 
         results = {
@@ -1177,6 +1208,7 @@ class LadybugMemory(AgentMemory):
             "discovered_schemas": [],
             "table_mapping": {},
             "entity_to_type": {},
+            "chunks": [],
         }
 
         if not self._entity_extractor:
@@ -1186,12 +1218,40 @@ class LadybugMemory(AgentMemory):
 
         extractor = self._entity_extractor
 
-        # Extract with broad labels to get entities
-        entities = extractor.extract_with_context(
-            content,
-            context={"memory_id": entry.id, "memory_type": memory_type},
-        )
+        chunker = LogicalChunker()
+        units = chunker.chunk(content)
+        chunk_ids = self._store_chunks(units, entry.id)
+        results["chunks"] = [
+            {"id": cid, "text": u.text}
+            for cid, u in zip(chunk_ids, units)
+            if cid is not None
+        ]
 
+        all_entities: dict[tuple[str, str], Entity] = {}
+        entity_to_chunks: dict[tuple[str, str], list[int]] = {}
+
+        for chunk_id, unit in zip(chunk_ids, units):
+            if chunk_id is None:
+                continue
+            chunk_entities = extractor.extract_with_context(unit.text)
+            for entity in chunk_entities:
+                key = (entity.text, entity.entity_type)
+                if key not in all_entities:
+                    all_entities[key] = Entity(
+                        id=None,
+                        text=entity.text,
+                        entity_type=entity.entity_type,
+                        confidence=entity.confidence,
+                        start_pos=entity.start_pos + unit.start,
+                        end_pos=entity.end_pos + unit.start,
+                        metadata=entity.metadata,
+                    )
+                if key not in entity_to_chunks:
+                    entity_to_chunks[key] = []
+                if chunk_id not in entity_to_chunks[key]:
+                    entity_to_chunks[key].append(chunk_id)
+
+        entities = list(all_entities.values())
         results["entities"] = entities
 
         if len(entities) == 0:
@@ -1220,32 +1280,36 @@ class LadybugMemory(AgentMemory):
         ]
         results["entity_to_type"] = entity_to_type
 
+        source_entity_ids: dict[str, int] = {}
+        for entity in entities:
+            self._store_entity_mention(entity, entry.id)
+            key = (entity.text, entity.entity_type)
+            chunk_ids_for_entity = entity_to_chunks.get(key, [])
+            for chunk_id in chunk_ids_for_entity:
+                self._link_entity_to_chunk(entity, chunk_id)
+            check_params = {
+                "canonical_name": entity.text,
+                "entity_type": entity.entity_type,
+            }
+            raw_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                WHERE e.canonical_name = $canonical_name
+                AND e.entity_type = $entity_type
+                RETURN e.id
+                """,
+                parameters=check_params,
+            )
+            res = _get_result(raw_result)
+            if res.has_next():
+                row = res.get_next()
+                source_entity_ids[entity.id] = int(row[0])
+
         if discovered_schemas:
             table_mapping = self.create_dynamic_schema_tables(
                 results["discovered_schemas"]
             )
             results["table_mapping"] = table_mapping
-
-            source_entity_ids: dict[str, int] = {}
-            for entity in entities:
-                self._store_entity_mention(entity, entry.id)
-                check_params = {
-                    "canonical_name": entity.text,
-                    "entity_type": entity.entity_type,
-                }
-                raw_result = self.conn.execute(
-                    """
-                    MATCH (e:Entity)
-                    WHERE e.canonical_name = $canonical_name
-                    AND e.entity_type = $entity_type
-                    RETURN e.id
-                    """,
-                    parameters=check_params,
-                )
-                res = _get_result(raw_result)
-                if res.has_next():
-                    row = res.get_next()
-                    source_entity_ids[entity.id] = int(row[0])
 
             for entity in entities:
                 if entity.id in entity_to_type:
@@ -1262,6 +1326,105 @@ class LadybugMemory(AgentMemory):
                             )
 
         return entry, results
+
+    def _store_chunks(self, units: list, memory_id: int) -> list[int | None]:
+        """Store logical chunks and link them to memory.
+
+        Args:
+            units: List of LogicalUnit objects
+            memory_id: ID of the parent memory
+
+        Returns:
+            List of chunk IDs (None for failed stores)
+        """
+        now = datetime.now()
+        chunk_ids: list[int | None] = []
+
+        for unit in units:
+            embedding = self._get_embedding(unit.text)
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+            escaped_text = unit.text.replace("'", "''")
+
+            create_cypher = f"""
+                CREATE (c:LogicalChunk {{
+                    text: '{escaped_text}',
+                    unit_type: '{unit.unit_type}',
+                    span_start: {unit.start},
+                    span_end: {unit.end},
+                    embedding: {embedding_str},
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+                RETURN c.id
+            """
+            raw_result = self.conn.execute(create_cypher)
+            result = _get_result(raw_result)
+
+            if result.has_next():
+                row = result.get_next()
+                chunk_id = int(row[0])
+                chunk_ids.append(chunk_id)
+
+                self.conn.execute(
+                    f"""
+                    MATCH (c:LogicalChunk), (m:Memory)
+                    WHERE c.id = {chunk_id} AND m.id = {memory_id}
+                    CREATE (c)-[r:ChunkOf]->(m)
+                    """
+                )
+            else:
+                chunk_ids.append(None)
+
+        return chunk_ids
+
+    def _link_entity_to_chunk(self, entity: Entity, chunk_id: int) -> None:
+        """Link an entity to a chunk it appears in.
+
+        Args:
+            entity: The entity to link
+            chunk_id: ID of the chunk
+        """
+        check_params = {
+            "canonical_name": entity.text,
+            "entity_type": entity.entity_type,
+        }
+        raw_result = self.conn.execute(
+            """
+            MATCH (e:Entity)
+            WHERE e.canonical_name = $canonical_name
+            AND e.entity_type = $entity_type
+            RETURN e.id
+            """,
+            parameters=check_params,
+        )
+        res = _get_result(raw_result)
+
+        if not res.has_next():
+            return
+
+        row = res.get_next()
+        entity_id = int(row[0])
+
+        check_rel = f"""
+            MATCH (e:Entity)-[r:AppearsIn]->(c:LogicalChunk)
+            WHERE e.id = {entity_id} AND c.id = {chunk_id}
+            RETURN r
+        """
+        raw_result = self.conn.execute(check_rel)
+        res = _get_result(raw_result)
+
+        if res.has_next():
+            return
+
+        self.conn.execute(
+            f"""
+            MATCH (e:Entity), (c:LogicalChunk)
+            WHERE e.id = {entity_id} AND c.id = {chunk_id}
+            CREATE (e)-[r:AppearsIn {{
+                mention_text: '{entity.text.replace("'", "''")}',
+                confidence: {entity.confidence}
+            }}]->(c)
+            """
+        )
 
     def _store_entity_in_typed_table(
         self,
