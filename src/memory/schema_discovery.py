@@ -365,6 +365,10 @@ class DynamicSchemaDiscovery:
         if len(entities) == 0:
             return [], {}
 
+        for entity in entities:
+            if entity.id is None:
+                entity.id = str(uuid.uuid4())
+
         # Group entities by GLiNER2 base type first
         entities_by_type: dict[str, list[Entity]] = defaultdict(list)
         for entity in entities:

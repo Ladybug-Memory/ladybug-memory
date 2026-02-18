@@ -1056,19 +1056,58 @@ class LadybugMemory(AgentMemory):
         """
         counts: dict[str, int] = {}
 
-        for entity in entities:
-            entity_type = entity_to_type.get(str(entity.id))
-            if not entity_type:
+        entity_type_by_key: dict[tuple[str, str], str] = {}
+        for key, type_name in entity_to_type.items():
+            if key == "None" or key is None:
                 continue
+            entity_type_by_key[(key, key)] = type_name
+
+        for entity in entities:
+            entity_type = None
+            if entity.id and entity.id in entity_to_type:
+                entity_type = entity_to_type[entity.id]
+            elif (entity.text, entity.entity_type) in entity_type_by_key:
+                entity_type = entity_type_by_key[(entity.text, entity.entity_type)]
+
+            if not entity_type:
+                entity_type = entity.entity_type
 
             table_name = table_mapping.get(entity_type)
             if not table_name:
+                for tname, tbl in table_mapping.items():
+                    if tname.lower() == entity.entity_type.lower():
+                        table_name = tbl
+                        break
+
+            if not table_name:
                 continue
 
-            # Store entity in typed table
-            self._store_entity_in_typed_table(
+            typed_entity_id = self._store_entity_in_typed_table(
                 entity, str(memory_id) if memory_id else "0", table_name
             )
+
+            if typed_entity_id is not None:
+                check_params = {
+                    "canonical_name": entity.text,
+                    "entity_type": entity.entity_type,
+                }
+                raw_result = self.conn.execute(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.canonical_name = $canonical_name
+                    AND e.entity_type = $entity_type
+                    RETURN e.id
+                    """,
+                    parameters=check_params,
+                )
+                res = _get_result(raw_result)
+                if res.has_next():
+                    row = res.get_next()
+                    source_id = int(row[0])
+                    self._create_sourced_from_relation(
+                        typed_entity_id, source_id, table_name
+                    )
+
             counts[table_name] = counts.get(table_name, 0) + 1
 
         return counts
@@ -1305,25 +1344,42 @@ class LadybugMemory(AgentMemory):
                 row = res.get_next()
                 source_entity_ids[entity.id] = int(row[0])
 
-        if discovered_schemas:
-            table_mapping = self.create_dynamic_schema_tables(
-                results["discovered_schemas"]
-            )
-            results["table_mapping"] = table_mapping
+        all_schemas = results["discovered_schemas"]
+        existing_types = {s["type_name"] for s in all_schemas}
+        for entity in entities:
+            specific_type = entity_to_type.get(entity.id)
+            if specific_type:
+                entity_type = specific_type
+            else:
+                entity_type = entity.entity_type
+                if entity_type not in existing_types:
+                    all_schemas.append(
+                        {
+                            "type_name": entity_type,
+                            "confidence": 1.0,
+                            "sample_entities": [entity.text],
+                            "cluster_id": -1,
+                            "size": 1,
+                        }
+                    )
+                    existing_types.add(entity_type)
 
-            for entity in entities:
-                if entity.id in entity_to_type:
-                    entity_type = entity_to_type[entity.id]
-                    if entity_type in table_mapping:
-                        table_name = table_mapping[entity_type]
-                        typed_entity_id = self._store_entity_in_typed_table(
-                            entity, entry.id, table_name
-                        )
-                        source_id = source_entity_ids.get(entity.id)
-                        if typed_entity_id is not None and source_id is not None:
-                            self._create_sourced_from_relation(
-                                typed_entity_id, source_id, table_name
-                            )
+        table_mapping = self.create_dynamic_schema_tables(all_schemas)
+        results["table_mapping"] = table_mapping
+
+        for entity in entities:
+            specific_type = entity_to_type.get(entity.id)
+            entity_type = specific_type if specific_type else entity.entity_type
+            if entity_type in table_mapping:
+                table_name = table_mapping[entity_type]
+                typed_entity_id = self._store_entity_in_typed_table(
+                    entity, entry.id, table_name
+                )
+                source_id = source_entity_ids.get(entity.id)
+                if typed_entity_id is not None and source_id is not None:
+                    self._create_sourced_from_relation(
+                        typed_entity_id, source_id, table_name
+                    )
 
         return entry, results
 
