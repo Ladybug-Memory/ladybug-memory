@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, cast
+import uuid
 
 import real_ladybug as lb
 from fastembed import TextEmbedding
@@ -1181,7 +1182,6 @@ class LadybugMemory(AgentMemory):
         if not self._entity_extractor:
             return entry, results
 
-        # Extract entities (without predefined schema)
         from memory.schema_discovery import DynamicSchemaDiscovery
 
         extractor = self._entity_extractor
@@ -1197,7 +1197,9 @@ class LadybugMemory(AgentMemory):
         if len(entities) == 0:
             return entry, results
 
-        # Discover schema through clustering
+        for entity in entities:
+            entity.id = str(uuid.uuid4())
+
         schema_discovery = DynamicSchemaDiscovery(
             similarity_threshold=0.75,
             min_cluster_size=2,
@@ -1218,20 +1220,46 @@ class LadybugMemory(AgentMemory):
         ]
         results["entity_to_type"] = entity_to_type
 
-        # Create dynamic tables for discovered schemas
         if discovered_schemas:
             table_mapping = self.create_dynamic_schema_tables(
                 results["discovered_schemas"]
             )
             results["table_mapping"] = table_mapping
 
-            # Store entities in their respective type tables
+            source_entity_ids: dict[str, int] = {}
+            for entity in entities:
+                self._store_entity_mention(entity, entry.id)
+                check_params = {
+                    "canonical_name": entity.text,
+                    "entity_type": entity.entity_type,
+                }
+                raw_result = self.conn.execute(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.canonical_name = $canonical_name
+                    AND e.entity_type = $entity_type
+                    RETURN e.id
+                    """,
+                    parameters=check_params,
+                )
+                res = _get_result(raw_result)
+                if res.has_next():
+                    row = res.get_next()
+                    source_entity_ids[entity.id] = int(row[0])
+
             for entity in entities:
                 if entity.id in entity_to_type:
                     entity_type = entity_to_type[entity.id]
                     if entity_type in table_mapping:
                         table_name = table_mapping[entity_type]
-                        self._store_entity_in_typed_table(entity, entry.id, table_name)
+                        typed_entity_id = self._store_entity_in_typed_table(
+                            entity, entry.id, table_name
+                        )
+                        source_id = source_entity_ids.get(entity.id)
+                        if typed_entity_id is not None and source_id is not None:
+                            self._create_sourced_from_relation(
+                                typed_entity_id, source_id, table_name
+                            )
 
         return entry, results
 
@@ -1240,17 +1268,19 @@ class LadybugMemory(AgentMemory):
         entity: Entity,
         memory_id: str,
         table_name: str,
-    ) -> None:
+    ) -> int | None:
         """Store an entity in a type-specific table.
 
         Args:
             entity: The entity to store
             memory_id: ID of the memory mentioning the entity
             table_name: Name of the type-specific table
+
+        Returns:
+            The ID of the created/found entity, or None on failure
         """
         now = datetime.now()
 
-        # Check if entity already exists
         check_cypher = f"""
             MATCH (e:{table_name})
             WHERE e.canonical_name = '{entity.text.replace("'", "''")}'
@@ -1259,13 +1289,11 @@ class LadybugMemory(AgentMemory):
         raw_result = self.conn.execute(check_cypher)
         result = _get_result(raw_result)
 
-        entity_id: str
+        entity_id: int
         if result.has_next():
-            # Entity exists, use existing ID
             row = result.get_next()
-            entity_id = str(row[0])
+            entity_id = int(row[0])
         else:
-            # Create new entity
             embedding = self._get_embedding(entity.text)
             embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
@@ -1282,10 +1310,11 @@ class LadybugMemory(AgentMemory):
             """
             raw_result = self.conn.execute(create_cypher)
             result = _get_result(raw_result)
+            if not result.has_next():
+                return None
             row = result.get_next()
-            entity_id = str(row[0])
+            entity_id = int(row[0])
 
-        # Create mention relationship
         rel_table_name = f"MentionedIn_{table_name}"
         mention_cypher = f"""
             MATCH (e:{table_name}), (m:Memory)
@@ -1298,3 +1327,34 @@ class LadybugMemory(AgentMemory):
             }}]->(m)
         """
         self.conn.execute(mention_cypher)
+
+        return entity_id
+
+    def _create_sourced_from_relation(
+        self, typed_entity_id: int, source_entity_id: int, table_name: str
+    ) -> None:
+        """Create a SourcedFrom relation from typed entity to source Entity.
+
+        Args:
+            typed_entity_id: ID of the entity in the typed table
+            source_entity_id: ID of the source entity in the generic Entity table
+            table_name: Name of the typed table
+        """
+        rel_table_name = f"SourcedFrom_{table_name}"
+        try:
+            self.conn.execute(
+                f"""
+                CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
+                    FROM {table_name} TO Entity
+                )
+                """
+            )
+        except Exception:
+            pass
+
+        cypher = f"""
+            MATCH (typed:{table_name}), (source:Entity)
+            WHERE typed.id = {typed_entity_id} AND source.id = {source_entity_id}
+            CREATE (typed)-[r:{rel_table_name}]->(source)
+        """
+        self.conn.execute(cypher)
