@@ -83,6 +83,8 @@ class AgentMemory(ABC):
         source_id: str,
         target_id: str,
         relation: str = "related",
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
     ) -> bool:
         pass
 
