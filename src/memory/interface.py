@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass
 class MemoryEntry:
-    id: str
+    id: int
     content: str
     memory_type: str = "general"
     importance: int = 5
@@ -83,6 +83,8 @@ class AgentMemory(ABC):
         source_id: str,
         target_id: str,
         relation: str = "related",
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
     ) -> bool:
         pass
 
@@ -97,4 +99,58 @@ class AgentMemory(ABC):
 
     @abstractmethod
     def count(self) -> int:
+        pass
+
+    # Knowledge Graph methods
+    @abstractmethod
+    def extract_entities(
+        self,
+        content: str,
+        labels: list[str] | None = None,
+        threshold: float | None = None,
+    ) -> list[Any]:
+        """Extract entities from content using GLiNER2.
+
+        Args:
+            content: The text to extract entities from
+            labels: Entity types to extract (uses defaults if None)
+            threshold: Confidence threshold (uses default if None)
+
+        Returns:
+            List of extracted entities
+        """
+        pass
+
+    @abstractmethod
+    def search_by_entity(
+        self,
+        entity_name: str,
+        limit: int = 5,
+    ) -> list[Any]:
+        """Find memories mentioning a specific entity.
+
+        Args:
+            entity_name: The entity name to search for
+            limit: Maximum number of results
+
+        Returns:
+            List of memories containing the entity
+        """
+        pass
+
+    @abstractmethod
+    def get_entity_graph(
+        self,
+        entity_id: str,
+        max_depth: int = 1,
+    ) -> dict[str, Any]:
+        """Get connected entities and their relationships.
+
+        Args:
+            entity_id: The entity ID to explore
+            max_depth: Maximum relationship depth
+
+        Returns:
+            Dictionary with entity and related entities
+        """
         pass

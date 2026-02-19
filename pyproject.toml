@@ -7,12 +7,20 @@ requires-python = ">=3.10"
 dependencies = [
     "real-ladybug>=0.14.0",
     "fastembed",
+    "gliner2>=0.0.1",
+    "icebug>=12.0",
+    "polars>=1.38.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
+]
+kg = [
+    "icebug",
+    "litellm",
+    "polars",
 ]
 
 [build-system]

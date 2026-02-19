@@ -11,3 +11,6 @@ build
 .DS_Store
 dist/
 uv.lock
+
+# Environment variables
+.env

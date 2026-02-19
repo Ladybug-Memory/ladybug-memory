@@ -1,11 +1,13 @@
-import os
-import uuid
 from datetime import datetime
 from typing import Any, cast
+import uuid
 
 import real_ladybug as lb
 from fastembed import TextEmbedding
 
+from memory.chunker import LogicalChunker
+from memory.entities import Entity
+from memory.extraction import GLiNEREntityExtractor
 from memory.interface import (
     AgentMemory,
     MemoryEntry,
@@ -20,12 +22,27 @@ def _get_result(result: lb.QueryResult | list[lb.QueryResult]) -> lb.QueryResult
 
 
 class LadybugMemory(AgentMemory):
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        enable_entity_extraction: bool = True,
+        gliner_model: str = "fastino/gliner2-base-v1",
+        entity_confidence_threshold: float = 0.85,
+    ):
         self.db = lb.Database(db_path)
         self.conn = lb.Connection(self.db)
         self._init_schema()
         self._init_fts_index()
         self._init_vector_search()
+
+        # Entity extraction
+        self._enable_entity_extraction = enable_entity_extraction
+        self._entity_extractor: GLiNEREntityExtractor | None = None
+        if enable_entity_extraction:
+            self._entity_extractor = GLiNEREntityExtractor(
+                model_name=gliner_model,
+                confidence_threshold=entity_confidence_threshold,
+            )
 
     def _init_schema(self) -> None:
         self.conn.execute("INSTALL JSON; LOAD EXTENSION JSON;")
@@ -34,7 +51,7 @@ class LadybugMemory(AgentMemory):
         self.conn.execute(
             """
             CREATE NODE TABLE IF NOT EXISTS Memory(
-                id STRING PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 content STRING,
                 memory_type STRING,
                 importance INT64,
@@ -49,7 +66,110 @@ class LadybugMemory(AgentMemory):
             """
             CREATE REL TABLE IF NOT EXISTS MemoryLink(
                 FROM Memory TO Memory,
-                relation STRING
+                relation STRING,
+                start_timestamp TIMESTAMP DEFAULT current_timestamp(),
+                end_timestamp TIMESTAMP DEFAULT current_timestamp()
+            )
+            """
+        )
+        # Entity schema for knowledge graph
+        self._init_entity_schema()
+
+    def _init_entity_schema(self) -> None:
+        """Initialize entity and mention tables for knowledge graph."""
+        # Entity nodes (canonical entities after disambiguation)
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS Entity(
+                id SERIAL PRIMARY KEY,
+                canonical_name STRING,
+                entity_type STRING,
+                embedding FLOAT[384],
+                metadata JSON,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        # Entity mention edges (links entities to memories)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS MentionedIn(
+                FROM Entity TO Memory,
+                mention_text STRING,
+                confidence FLOAT,
+                span_start INT64,
+                span_end INT64
+            )
+            """
+        )
+        # Coreference edges (links similar entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Coreference(
+                FROM Entity TO Entity,
+                similarity_score FLOAT
+            )
+            """
+        )
+        # Relations edges (extracted relations between entities)
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS Relations(
+                FROM Entity TO Entity,
+                relation_type STRING,
+                confidence FLOAT,
+                source_text STRING,
+                target_text STRING,
+                metadata JSON,
+                start_timestamp TIMESTAMP DEFAULT current_timestamp(),
+                end_timestamp TIMESTAMP DEFAULT current_timestamp()
+            )
+            """
+        )
+        # Logical chunks for H-GLUE architecture
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS LogicalChunk(
+                id SERIAL PRIMARY KEY,
+                text STRING,
+                unit_type STRING,
+                span_start INT64,
+                span_end INT64,
+                embedding FLOAT[384],
+                created_at TIMESTAMP
+            )
+            """
+        )
+        # Entity to chunk relationship
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS AppearsIn(
+                FROM Entity TO LogicalChunk,
+                mention_text STRING,
+                confidence FLOAT
+            )
+            """
+        )
+        # Chunk to memory relationship
+        self.conn.execute(
+            """
+            CREATE REL TABLE IF NOT EXISTS ChunkOf(
+                FROM LogicalChunk TO Memory
+            )
+            """
+        )
+        # Discovered schema types (tracks hierarchy: specific_type IS_A base_type)
+        self.conn.execute(
+            """
+            CREATE NODE TABLE IF NOT EXISTS DiscoveredSchemaType(
+                id SERIAL PRIMARY KEY,
+                type_name STRING,
+                base_type STRING,
+                confidence FLOAT,
+                sample_entities JSON,
+                entity_count INT64,
+                created_at TIMESTAMP
             )
             """
         )
@@ -76,7 +196,10 @@ class LadybugMemory(AgentMemory):
         if not hasattr(self, "_embedding_model"):
             self._init_embedding_model()
         embeddings = list(self._embedding_model.embed([text]))
-        return embeddings[0]
+        emb = embeddings[0]
+        if hasattr(emb, "tolist"):
+            return emb.tolist()
+        return list(emb)
 
     def _init_vector_search(self) -> None:
         try:
@@ -96,7 +219,7 @@ class LadybugMemory(AgentMemory):
     def _row_to_entry(self, row: list | dict) -> MemoryEntry:
         if isinstance(row, dict):
             return MemoryEntry(
-                id=cast(str, row.get("id")),
+                id=cast(int, row.get("id")),
                 content=cast(str, row.get("content")),
                 memory_type=cast(str, row.get("memory_type")),
                 importance=cast(int, row.get("importance")),
@@ -105,7 +228,7 @@ class LadybugMemory(AgentMemory):
                 updated_at=cast(datetime, row.get("updated_at")),
             )
         return MemoryEntry(
-            id=str(row[0]),
+            id=int(row[0]),
             content=str(row[1]),
             memory_type=str(row[2]),
             importance=int(row[3]),
@@ -121,27 +244,56 @@ class LadybugMemory(AgentMemory):
         importance: int = 5,
         metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry:
-        memory_id = str(uuid.uuid4())
         now = datetime.now()
-        metadata_json = f"CAST('{str(metadata)}' AS JSON)" if metadata else "NULL"
         embedding = self._get_embedding(content)
-        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
-        self.conn.execute(
-            f"""
-            CREATE (m:Memory {{
-                id: '{memory_id}',
-                content: '{content.replace("'", "''")}',
-                memory_type: '{memory_type}',
-                importance: {importance},
-                metadata: {metadata_json},
-                embedding: {embedding_str},
-                created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
-                updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
-            }})
-            RETURN m.id
-            """
-        )
+        parameters = {
+            "content": content,
+            "memory_type": memory_type,
+            "importance": importance,
+            "embedding": embedding,
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        if metadata:
+            import json
+
+            parameters["metadata"] = json.dumps(metadata)
+            raw_result = self.conn.execute(
+                """
+                CREATE (m:Memory {
+                    content: $content,
+                    memory_type: $memory_type,
+                    importance: $importance,
+                    metadata: CAST($metadata AS JSON),
+                    embedding: $embedding,
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
+                RETURN m.id
+                """,
+                parameters=parameters,
+            )
+        else:
+            raw_result = self.conn.execute(
+                """
+                CREATE (m:Memory {
+                    content: $content,
+                    memory_type: $memory_type,
+                    importance: $importance,
+                    embedding: $embedding,
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
+                RETURN m.id
+                """,
+                parameters=parameters,
+            )
+
+        result = _get_result(raw_result)
+        row = result.get_next()
+        memory_id = int(row[0])
 
         return MemoryEntry(
             id=memory_id,
@@ -272,7 +424,7 @@ class LadybugMemory(AgentMemory):
     def get(self, memory_id: str) -> MemoryEntry | None:
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
         """
 
@@ -295,7 +447,8 @@ class LadybugMemory(AgentMemory):
         updates = []
 
         if content is not None:
-            updates.append(f"m.content = '{content.replace("'", "''")}'")
+            escaped_content = content.replace("'", "''")
+            updates.append(f"m.content = '{escaped_content}'")
         if importance is not None:
             updates.append(f"m.importance = {importance}")
         if metadata is not None:
@@ -311,7 +464,7 @@ class LadybugMemory(AgentMemory):
 
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             SET {", ".join(updates)}
             RETURN m.id, m.content, m.memory_type, m.importance, m.metadata, m.created_at, m.updated_at
         """
@@ -328,7 +481,7 @@ class LadybugMemory(AgentMemory):
     def delete(self, memory_id: str) -> bool:
         cypher = f"""
             MATCH (m:Memory)
-            WHERE m.id = '{memory_id}'
+            WHERE m.id = {memory_id}
             DELETE m
         """
 
@@ -340,11 +493,19 @@ class LadybugMemory(AgentMemory):
         source_id: str,
         target_id: str,
         relation: str = "related",
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
     ) -> bool:
+        start_ts = start_timestamp or datetime.now()
+        end_ts = end_timestamp or datetime.now()
         cypher = f"""
             MATCH (a:Memory), (b:Memory)
-            WHERE a.id = '{source_id}' AND b.id = '{target_id}'
-            CREATE (a)-[r:MemoryLink {{relation: '{relation}'}}]->(b)
+            WHERE a.id = {source_id} AND b.id = {target_id}
+            CREATE (a)-[r:MemoryLink {{
+                relation: '{relation}',
+                start_timestamp: timestamp('{start_ts.strftime("%Y-%m-%d %H:%M:%S")}'),
+                end_timestamp: timestamp('{end_ts.strftime("%Y-%m-%d %H:%M:%S")}')
+            }}]->(b)
         """
 
         self.conn.execute(cypher)
@@ -359,13 +520,13 @@ class LadybugMemory(AgentMemory):
         if relation:
             cypher = f"""
                 MATCH (m:Memory)-[r:MemoryLink {{relation: '{relation}'}}]->(related:Memory)
-                WHERE m.id = '{memory_id}'
+                WHERE m.id = {memory_id}
                 RETURN related.id, related.content, related.memory_type, related.importance, related.metadata, related.created_at, related.updated_at, r.relation
             """
         else:
             cypher = f"""
                 MATCH (m:Memory)-[r:MemoryLink]->(related:Memory)
-                WHERE m.id = '{memory_id}'
+                WHERE m.id = {memory_id}
                 RETURN related.id, related.content, related.memory_type, related.importance, related.metadata, related.created_at, related.updated_at, r.relation
             """
 
@@ -403,3 +564,1027 @@ class LadybugMemory(AgentMemory):
             return int(row[0])
 
         return 0
+
+    # Entity extraction methods
+    def extract_entities(
+        self,
+        content: str,
+        labels: list[str] | None = None,
+        threshold: float | None = None,
+    ) -> list[Entity]:
+        """Extract entities from content using GLiNER2.
+
+        Args:
+            content: The text to extract entities from
+            labels: Entity types to extract (uses defaults if None)
+            threshold: Confidence threshold (uses default if None)
+
+        Returns:
+            List of extracted entities
+        """
+        if not self._entity_extractor:
+            raise RuntimeError(
+                "Entity extraction is not enabled. Initialize with enable_entity_extraction=True"
+            )
+
+        return self._entity_extractor.extract_with_context(
+            content, labels=labels, threshold=threshold
+        )
+
+    def store_with_entities(
+        self,
+        content: str,
+        memory_type: str = "general",
+        importance: int = 5,
+        metadata: dict[str, Any] | None = None,
+        extract_entities: bool = True,
+    ) -> tuple[MemoryEntry, list[Entity], int]:
+        """Store memory and optionally extract/link entities and relations.
+
+        Uses H-GLUE logical chunking to improve relation extraction by
+        processing semantically coherent units rather than entire documents.
+
+        Args:
+            content: The memory content
+            memory_type: Type of memory
+            importance: Importance score
+            metadata: Additional metadata
+            extract_entities: Whether to extract and link entities
+
+        Returns:
+            Tuple of (MemoryEntry, list of extracted entities, relations_count)
+        """
+        entry = self.store(content, memory_type, importance, metadata)
+
+        entities: list[Entity] = []
+        relations_count = 0
+        if extract_entities and self._entity_extractor:
+            chunker = LogicalChunker()
+            units = chunker.chunk(content)
+
+            all_entities: dict[tuple[str, str], Entity] = {}
+            all_relations: list[Any] = []
+
+            for unit in units:
+                result = self._entity_extractor.extract_all(unit.text)
+                for ext in result.get("entities", []):
+                    key = (ext.text, ext.entity_type)
+                    if key not in all_entities:
+                        all_entities[key] = Entity(
+                            id=None,
+                            text=ext.text,
+                            entity_type=ext.entity_type,
+                            confidence=ext.confidence,
+                            start_pos=ext.start_pos + unit.start,
+                            end_pos=ext.end_pos + unit.start,
+                            metadata=ext.metadata,
+                        )
+                all_relations.extend(result.get("relations", []))
+
+            entities = list(all_entities.values())
+            relations_count = len(all_relations)
+
+            for entity in entities:
+                self._store_entity_mention(entity, entry.id)
+
+            self._store_relations(all_relations)
+
+        return entry, entities, relations_count
+
+    def _store_entity_mention(self, entity: Entity, memory_id: str | int) -> None:
+        """Store an entity mention and link it to a memory.
+
+        Args:
+            entity: The extracted entity
+            memory_id: The ID of the memory containing the entity
+        """
+        now = datetime.now()
+        memory_id_str = str(memory_id)
+
+        check_params = {
+            "canonical_name": entity.text,
+            "entity_type": entity.entity_type,
+        }
+        raw_result = self.conn.execute(
+            """
+            MATCH (e:Entity)
+            WHERE e.canonical_name = $canonical_name
+            AND e.entity_type = $entity_type
+            RETURN e.id
+            """,
+            parameters=check_params,
+        )
+        result = _get_result(raw_result)
+
+        entity_id: str
+        if result.has_next():
+            row = result.get_next()
+            entity_id = str(row[0])
+        else:
+            embedding = self._get_embedding(entity.text)
+            create_params = {
+                "canonical_name": entity.text,
+                "entity_type": entity.entity_type,
+                "embedding": embedding,
+                "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            raw_result = self.conn.execute(
+                """
+                CREATE (e:Entity {
+                    canonical_name: $canonical_name,
+                    entity_type: $entity_type,
+                    embedding: $embedding,
+                    metadata: NULL,
+                    created_at: timestamp($created_at),
+                    updated_at: timestamp($updated_at)
+                })
+                RETURN e.id
+                """,
+                parameters=create_params,
+            )
+            result = _get_result(raw_result)
+            row = result.get_next()
+            entity_id = str(row[0])
+
+        mention_params = {
+            "entity_id": int(entity_id),
+            "memory_id": int(memory_id_str),
+            "mention_text": entity.text,
+            "confidence": entity.confidence,
+            "span_start": entity.start_pos,
+            "span_end": entity.end_pos,
+        }
+        self.conn.execute(
+            """
+            MATCH (e:Entity), (m:Memory)
+            WHERE e.id = $entity_id AND m.id = $memory_id
+            CREATE (e)-[r:MentionedIn {
+                mention_text: $mention_text,
+                confidence: $confidence,
+                span_start: $span_start,
+                span_end: $span_end
+            }]->(m)
+            """,
+            parameters=mention_params,
+        )
+
+    def _store_relations(
+        self,
+        relations: list,
+        start_timestamp: datetime | None = None,
+        end_timestamp: datetime | None = None,
+    ) -> None:
+        import json
+
+        now = datetime.now()
+        start_ts = start_timestamp or now
+        end_ts = end_timestamp or now
+
+        for rel in relations:
+            source_embedding = self._get_embedding(rel.source_text)
+            target_embedding = self._get_embedding(rel.target_text)
+
+            source_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.embedding,
+                       array_cosine_similarity(e.embedding, $query_embedding) AS score
+                ORDER BY score DESC
+                LIMIT 1
+                """,
+                parameters={"query_embedding": source_embedding},
+            )
+            res = _get_result(source_result)
+            if not res.has_next():
+                continue
+            source_row = res.get_next()
+            source_id = source_row[0]
+            source_score = source_row[3] if len(source_row) > 3 else 0.0
+            if source_score < 0.85:
+                continue
+
+            target_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.embedding,
+                       array_cosine_similarity(e.embedding, $query_embedding) AS score
+                ORDER BY score DESC
+                LIMIT 1
+                """,
+                parameters={"query_embedding": target_embedding},
+            )
+            res = _get_result(target_result)
+            if not res.has_next():
+                continue
+            target_row = res.get_next()
+            target_id = target_row[0]
+            target_score = target_row[3] if len(target_row) > 3 else 0.0
+            if target_score < 0.85:
+                continue
+
+            rel_start = start_ts
+            rel_end = end_ts
+            if rel.metadata and isinstance(rel.metadata, dict):
+                if "start_timestamp" in rel.metadata:
+                    rel_start = rel.metadata["start_timestamp"]
+                if "end_timestamp" in rel.metadata:
+                    rel_end = rel.metadata["end_timestamp"]
+
+            rel_params = {
+                "source_id": int(source_id),
+                "target_id": int(target_id),
+                "relation_type": rel.relation_type,
+                "confidence": rel.confidence,
+                "metadata": json.dumps(rel.metadata) if rel.metadata else None,
+                "start_timestamp": rel_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_timestamp": rel_end.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.conn.execute(
+                """
+                MATCH (s:Entity), (t:Entity)
+                WHERE s.id = $source_id AND t.id = $target_id
+                CREATE (s)-[r:Relations {
+                    relation_type: $relation_type,
+                    confidence: $confidence,
+                    metadata: $metadata,
+                    start_timestamp: timestamp($start_timestamp),
+                    end_timestamp: timestamp($end_timestamp)
+                }]->(t)
+                """,
+                parameters=rel_params,
+            )
+
+    def search_by_entity(
+        self,
+        entity_name: str,
+        limit: int = 5,
+    ) -> list[MemorySearchResult]:
+        """Find memories mentioning a specific entity.
+
+        Args:
+            entity_name: The entity name to search for
+            limit: Maximum number of results
+
+        Returns:
+            List of memories containing the entity
+        """
+        cypher = f"""
+            MATCH (e:Entity)-[r:MentionedIn]->(m:Memory)
+            WHERE e.canonical_name = '{entity_name.replace("'", "''")}'
+            RETURN m.id, m.content, m.memory_type, m.importance, m.metadata,
+                   m.created_at, m.updated_at, r.confidence
+            ORDER BY r.confidence DESC, m.importance DESC
+            LIMIT {limit}
+        """
+
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+        search_results = []
+
+        while result.has_next():
+            row = result.get_next()
+            entry = self._row_to_entry(row)
+            confidence = float(row[7]) if len(row) > 7 else 1.0
+            search_results.append(MemorySearchResult(entry=entry, score=confidence))
+
+        return search_results
+
+    def get_entity_graph(
+        self,
+        entity_id: str,
+        max_depth: int = 1,
+    ) -> dict[str, Any]:
+        """Get connected entities and their relationships.
+
+        Args:
+            entity_id: The entity ID to explore
+            max_depth: Maximum relationship depth
+
+        Returns:
+            Dictionary with entity and related entities
+        """
+        # Get the main entity
+        entity_cypher = f"""
+            MATCH (e:Entity)
+            WHERE e.id = {entity_id}
+            RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+        """
+        raw_result = self.conn.execute(entity_cypher)
+        result = _get_result(raw_result)
+
+        if not result.has_next():
+            return {}
+
+        row = result.get_next()
+        entity_data = {
+            "id": str(row[0]),
+            "canonical_name": str(row[1]),
+            "entity_type": str(row[2]),
+            "metadata": row[3],
+        }
+
+        # Get related entities via coreference
+        related_cypher = f"""
+            MATCH (e:Entity)-[c:Coreference]->(related:Entity)
+            WHERE e.id = {entity_id}
+            RETURN related.id, related.canonical_name, related.entity_type, c.similarity_score
+        """
+        raw_result = self.conn.execute(related_cypher)
+        result = _get_result(raw_result)
+
+        related_entities = []
+        while result.has_next():
+            row = result.get_next()
+            related_entities.append(
+                {
+                    "id": str(row[0]),
+                    "canonical_name": str(row[1]),
+                    "entity_type": str(row[2]),
+                    "similarity_score": float(row[3]) if row[3] else 0.0,
+                }
+            )
+
+        # Get mentioned memories
+        memories_cypher = f"""
+            MATCH (e:Entity)-[r:MentionedIn]->(m:Memory)
+            WHERE e.id = {entity_id}
+            RETURN m.id, m.content, r.confidence
+            ORDER BY r.confidence DESC
+            LIMIT 10
+        """
+        raw_result = self.conn.execute(memories_cypher)
+        result = _get_result(raw_result)
+
+        mentioned_memories = []
+        while result.has_next():
+            row = result.get_next()
+            mentioned_memories.append(
+                {
+                    "memory_id": str(row[0]),
+                    "content_preview": str(row[1])[:200] + "..."
+                    if len(str(row[1])) > 200
+                    else str(row[1]),
+                    "mention_confidence": float(row[2]) if row[2] else 0.0,
+                }
+            )
+
+        return {
+            "entity": entity_data,
+            "related_entities": related_entities,
+            "mentioned_in": mentioned_memories,
+        }
+
+    def get_all_entities(
+        self,
+        entity_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get all entities, optionally filtered by type.
+
+        Args:
+            entity_type: Filter by entity type (optional)
+            limit: Maximum number of results
+
+        Returns:
+            List of entity dictionaries
+        """
+        if entity_type:
+            cypher = f"""
+                MATCH (e:Entity)
+                WHERE e.entity_type = '{entity_type}'
+                RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+                LIMIT {limit}
+            """
+        else:
+            cypher = f"""
+                MATCH (e:Entity)
+                RETURN e.id, e.canonical_name, e.entity_type, e.metadata
+                LIMIT {limit}
+            """
+
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+
+        entities = []
+        while result.has_next():
+            row = result.get_next()
+            entities.append(
+                {
+                    "id": str(row[0]),
+                    "canonical_name": str(row[1]),
+                    "entity_type": str(row[2]),
+                    "metadata": row[3],
+                }
+            )
+
+        return entities
+
+    # Dynamic schema methods
+    def create_dynamic_schema_tables(
+        self,
+        discovered_schemas: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Create node and relationship tables for discovered schemas.
+
+        Args:
+            discovered_schemas: List of discovered schema types from clustering
+
+        Returns:
+            Dictionary mapping schema type names to table names
+        """
+        table_mapping = {}
+
+        for schema in discovered_schemas:
+            type_name = schema["type_name"]
+            confidence = schema.get("confidence", 0.0)
+
+            # Only create tables for high-confidence schemas
+            if confidence < 0.5:
+                continue
+
+            # Sanitize type name for table name
+            table_name = self._sanitize_table_name(type_name)
+
+            # Check if table already exists
+            try:
+                # Create node table for this entity type
+                self.conn.execute(
+                    f"""
+                    CREATE NODE TABLE IF NOT EXISTS {table_name}(
+                        id SERIAL PRIMARY KEY,
+                        canonical_name STRING,
+                        entity_type STRING DEFAULT '{type_name}',
+                        embedding FLOAT[384],
+                        metadata JSON,
+                        discovered_confidence FLOAT DEFAULT {confidence},
+                        created_at TIMESTAMP,
+                        updated_at TIMESTAMP
+                    )
+                    """
+                )
+
+                # Create relationship table for mentions
+                rel_table_name = f"MentionedIn_{table_name}"
+                self.conn.execute(
+                    f"""
+                    CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
+                        FROM {table_name} TO Memory,
+                        mention_text STRING,
+                        confidence FLOAT,
+                        span_start INT64,
+                        span_end INT64
+                    )
+                    """
+                )
+
+                table_mapping[type_name] = table_name
+
+            except Exception as e:
+                # Table might already exist or other error
+                print(f"Warning: Could not create table for {type_name}: {e}")
+                continue
+
+        return table_mapping
+
+    def populate_dynamic_schema_tables(
+        self,
+        entities: list[Entity],
+        entity_to_type: dict[str, str],
+        table_mapping: dict[str, str],
+        memory_id: int | None = None,
+    ) -> dict[str, int]:
+        """Populate dynamic schema tables with entities from the generic Entity table.
+
+        Args:
+            entities: List of entities to populate
+            entity_to_type: Mapping from entity ID to discovered type name
+            table_mapping: Mapping from type name to table name
+            memory_id: Optional memory ID to link entities to
+
+        Returns:
+            Dictionary with counts of entities stored per table
+        """
+        counts: dict[str, int] = {}
+
+        entity_type_by_key: dict[tuple[str, str], str] = {}
+        for key, type_name in entity_to_type.items():
+            if key == "None" or key is None:
+                continue
+            entity_type_by_key[(key, key)] = type_name
+
+        for entity in entities:
+            entity_type = None
+            if entity.id and entity.id in entity_to_type:
+                entity_type = entity_to_type[entity.id]
+            elif (entity.text, entity.entity_type) in entity_type_by_key:
+                entity_type = entity_type_by_key[(entity.text, entity.entity_type)]
+
+            if not entity_type:
+                entity_type = entity.entity_type
+
+            table_name = table_mapping.get(entity_type)
+            if not table_name:
+                for tname, tbl in table_mapping.items():
+                    if tname.lower() == entity.entity_type.lower():
+                        table_name = tbl
+                        break
+
+            if not table_name:
+                continue
+
+            typed_entity_id = self._store_entity_in_typed_table(
+                entity, str(memory_id) if memory_id else "0", table_name
+            )
+
+            if typed_entity_id is not None:
+                check_params = {
+                    "canonical_name": entity.text,
+                    "entity_type": entity.entity_type,
+                }
+                raw_result = self.conn.execute(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.canonical_name = $canonical_name
+                    AND e.entity_type = $entity_type
+                    RETURN e.id
+                    """,
+                    parameters=check_params,
+                )
+                res = _get_result(raw_result)
+                if res.has_next():
+                    row = res.get_next()
+                    source_id = int(row[0])
+                    self._create_sourced_from_relation(
+                        typed_entity_id, source_id, table_name
+                    )
+
+            counts[table_name] = counts.get(table_name, 0) + 1
+
+        return counts
+
+    def store_schema_hierarchy(
+        self,
+        discovered_schemas: list[dict[str, Any]],
+    ) -> int:
+        """Store discovered schema types in the hierarchy table.
+
+        Args:
+            discovered_schemas: List of discovered schema dicts with type_name, base_type, etc.
+
+        Returns:
+            Number of schema types stored
+        """
+        import json
+
+        now = datetime.now()
+        count = 0
+
+        for schema in discovered_schemas:
+            type_name = schema.get("type_name", "")
+            base_type = schema.get("base_type", "unknown")
+            confidence = schema.get("confidence", 0.0)
+            sample_entities = schema.get("sample_entities", [])
+            entity_count = schema.get("size", 0)
+
+            if type_name.lower() == base_type.lower():
+                continue
+
+            check_params = {"type_name": type_name}
+            raw_result = self.conn.execute(
+                """
+                MATCH (s:DiscoveredSchemaType)
+                WHERE s.type_name = $type_name
+                RETURN s.id
+                """,
+                parameters=check_params,
+            )
+            result = _get_result(raw_result)
+
+            if result.has_next():
+                continue
+
+            samples_json = json.dumps(sample_entities[:10])
+            create_params = {
+                "type_name": type_name,
+                "base_type": base_type,
+                "confidence": confidence,
+                "sample_entities": samples_json,
+                "entity_count": entity_count,
+                "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.conn.execute(
+                """
+                CREATE (s:DiscoveredSchemaType {
+                    type_name: $type_name,
+                    base_type: $base_type,
+                    confidence: $confidence,
+                    sample_entities: CAST($sample_entities AS JSON),
+                    entity_count: $entity_count,
+                    created_at: timestamp($created_at)
+                })
+                """,
+                parameters=create_params,
+            )
+            count += 1
+
+        return count
+
+    def get_schema_hierarchy(self) -> list[dict[str, Any]]:
+        """Get all discovered schema types and their hierarchy.
+
+        Returns:
+            List of schema type dicts with type_name, base_type, etc.
+        """
+        import json
+
+        cypher = """
+            MATCH (s:DiscoveredSchemaType)
+            RETURN s.type_name, s.base_type, s.confidence, s.sample_entities, s.entity_count
+            ORDER BY s.base_type, s.confidence DESC
+        """
+        raw_result = self.conn.execute(cypher)
+        result = _get_result(raw_result)
+
+        schemas = []
+        while result.has_next():
+            row = result.get_next()
+            samples_json = row[3] if row[3] else "[]"
+            schemas.append(
+                {
+                    "type_name": row[0],
+                    "base_type": row[1],
+                    "confidence": row[2],
+                    "sample_entities": json.loads(samples_json),
+                    "entity_count": row[4],
+                }
+            )
+
+        return schemas
+
+    def _sanitize_table_name(self, name: str) -> str:
+        """Sanitize a schema type name for use as a table name."""
+        # Replace spaces and special characters with underscores
+        import re
+
+        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        # Ensure it starts with a letter
+        if sanitized[0].isdigit():
+            sanitized = "Entity_" + sanitized
+        return sanitized
+
+    def store_with_dynamic_schema(
+        self,
+        content: str,
+        memory_type: str = "general",
+        importance: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[MemoryEntry, dict[str, Any]]:
+        """Store memory and discover/create dynamic schema for entities.
+
+        Args:
+            content: The memory content
+            memory_type: Type of memory
+            importance: Importance score
+            metadata: Additional metadata
+
+        Returns:
+            Tuple of (MemoryEntry, schema discovery results)
+        """
+        entry = self.store(content, memory_type, importance, metadata)
+
+        results = {
+            "entities": [],
+            "discovered_schemas": [],
+            "table_mapping": {},
+            "entity_to_type": {},
+            "chunks": [],
+        }
+
+        if not self._entity_extractor:
+            return entry, results
+
+        from memory.schema_discovery import DynamicSchemaDiscovery
+
+        extractor = self._entity_extractor
+
+        chunker = LogicalChunker()
+        units = chunker.chunk(content)
+        chunk_ids = self._store_chunks(units, entry.id)
+        results["chunks"] = [
+            {"id": cid, "text": u.text}
+            for cid, u in zip(chunk_ids, units)
+            if cid is not None
+        ]
+
+        all_entities: dict[tuple[str, str], Entity] = {}
+        entity_to_chunks: dict[tuple[str, str], list[int]] = {}
+
+        for chunk_id, unit in zip(chunk_ids, units):
+            if chunk_id is None:
+                continue
+            chunk_entities = extractor.extract_with_context(unit.text)
+            for entity in chunk_entities:
+                key = (entity.text, entity.entity_type)
+                if key not in all_entities:
+                    all_entities[key] = Entity(
+                        id=None,
+                        text=entity.text,
+                        entity_type=entity.entity_type,
+                        confidence=entity.confidence,
+                        start_pos=entity.start_pos + unit.start,
+                        end_pos=entity.end_pos + unit.start,
+                        metadata=entity.metadata,
+                    )
+                if key not in entity_to_chunks:
+                    entity_to_chunks[key] = []
+                if chunk_id not in entity_to_chunks[key]:
+                    entity_to_chunks[key].append(chunk_id)
+
+        entities = list(all_entities.values())
+        results["entities"] = entities
+
+        if len(entities) == 0:
+            return entry, results
+
+        for entity in entities:
+            entity.id = str(uuid.uuid4())
+
+        schema_discovery = DynamicSchemaDiscovery(
+            similarity_threshold=0.75,
+            min_cluster_size=2,
+            min_confidence=0.6,
+        )
+
+        discovered_schemas, entity_to_type = schema_discovery.discover_schema(entities)
+
+        results["discovered_schemas"] = [
+            {
+                "type_name": s.type_name,
+                "confidence": s.confidence,
+                "sample_entities": s.sample_entities,
+                "cluster_id": s.cluster_id,
+                "size": s.size,
+            }
+            for s in discovered_schemas
+        ]
+        results["entity_to_type"] = entity_to_type
+
+        source_entity_ids: dict[str, int] = {}
+        for entity in entities:
+            self._store_entity_mention(entity, entry.id)
+            key = (entity.text, entity.entity_type)
+            chunk_ids_for_entity = entity_to_chunks.get(key, [])
+            for chunk_id in chunk_ids_for_entity:
+                self._link_entity_to_chunk(entity, chunk_id)
+            check_params = {
+                "canonical_name": entity.text,
+                "entity_type": entity.entity_type,
+            }
+            raw_result = self.conn.execute(
+                """
+                MATCH (e:Entity)
+                WHERE e.canonical_name = $canonical_name
+                AND e.entity_type = $entity_type
+                RETURN e.id
+                """,
+                parameters=check_params,
+            )
+            res = _get_result(raw_result)
+            if res.has_next():
+                row = res.get_next()
+                source_entity_ids[entity.id] = int(row[0])
+
+        all_schemas = results["discovered_schemas"]
+        existing_types = {s["type_name"] for s in all_schemas}
+        for entity in entities:
+            specific_type = entity_to_type.get(entity.id)
+            if specific_type:
+                entity_type = specific_type
+            else:
+                entity_type = entity.entity_type
+                if entity_type not in existing_types:
+                    all_schemas.append(
+                        {
+                            "type_name": entity_type,
+                            "confidence": 1.0,
+                            "sample_entities": [entity.text],
+                            "cluster_id": -1,
+                            "size": 1,
+                        }
+                    )
+                    existing_types.add(entity_type)
+
+        table_mapping = self.create_dynamic_schema_tables(all_schemas)
+        results["table_mapping"] = table_mapping
+
+        for entity in entities:
+            specific_type = entity_to_type.get(entity.id)
+            entity_type = specific_type if specific_type else entity.entity_type
+            if entity_type in table_mapping:
+                table_name = table_mapping[entity_type]
+                typed_entity_id = self._store_entity_in_typed_table(
+                    entity, entry.id, table_name
+                )
+                source_id = source_entity_ids.get(entity.id)
+                if typed_entity_id is not None and source_id is not None:
+                    self._create_sourced_from_relation(
+                        typed_entity_id, source_id, table_name
+                    )
+
+        return entry, results
+
+    def _store_chunks(self, units: list, memory_id: int) -> list[int | None]:
+        """Store logical chunks and link them to memory.
+
+        Args:
+            units: List of LogicalUnit objects
+            memory_id: ID of the parent memory
+
+        Returns:
+            List of chunk IDs (None for failed stores)
+        """
+        now = datetime.now()
+        chunk_ids: list[int | None] = []
+
+        for unit in units:
+            embedding = self._get_embedding(unit.text)
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+            escaped_text = unit.text.replace("'", "''")
+
+            create_cypher = f"""
+                CREATE (c:LogicalChunk {{
+                    text: '{escaped_text}',
+                    unit_type: '{unit.unit_type}',
+                    span_start: {unit.start},
+                    span_end: {unit.end},
+                    embedding: {embedding_str},
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+                RETURN c.id
+            """
+            raw_result = self.conn.execute(create_cypher)
+            result = _get_result(raw_result)
+
+            if result.has_next():
+                row = result.get_next()
+                chunk_id = int(row[0])
+                chunk_ids.append(chunk_id)
+
+                self.conn.execute(
+                    f"""
+                    MATCH (c:LogicalChunk), (m:Memory)
+                    WHERE c.id = {chunk_id} AND m.id = {memory_id}
+                    CREATE (c)-[r:ChunkOf]->(m)
+                    """
+                )
+            else:
+                chunk_ids.append(None)
+
+        return chunk_ids
+
+    def _link_entity_to_chunk(self, entity: Entity, chunk_id: int) -> None:
+        """Link an entity to a chunk it appears in.
+
+        Args:
+            entity: The entity to link
+            chunk_id: ID of the chunk
+        """
+        check_params = {
+            "canonical_name": entity.text,
+            "entity_type": entity.entity_type,
+        }
+        raw_result = self.conn.execute(
+            """
+            MATCH (e:Entity)
+            WHERE e.canonical_name = $canonical_name
+            AND e.entity_type = $entity_type
+            RETURN e.id
+            """,
+            parameters=check_params,
+        )
+        res = _get_result(raw_result)
+
+        if not res.has_next():
+            return
+
+        row = res.get_next()
+        entity_id = int(row[0])
+
+        check_rel = f"""
+            MATCH (e:Entity)-[r:AppearsIn]->(c:LogicalChunk)
+            WHERE e.id = {entity_id} AND c.id = {chunk_id}
+            RETURN r
+        """
+        raw_result = self.conn.execute(check_rel)
+        res = _get_result(raw_result)
+
+        if res.has_next():
+            return
+
+        self.conn.execute(
+            f"""
+            MATCH (e:Entity), (c:LogicalChunk)
+            WHERE e.id = {entity_id} AND c.id = {chunk_id}
+            CREATE (e)-[r:AppearsIn {{
+                mention_text: '{entity.text.replace("'", "''")}',
+                confidence: {entity.confidence}
+            }}]->(c)
+            """
+        )
+
+    def _store_entity_in_typed_table(
+        self,
+        entity: Entity,
+        memory_id: str,
+        table_name: str,
+    ) -> int | None:
+        """Store an entity in a type-specific table.
+
+        Args:
+            entity: The entity to store
+            memory_id: ID of the memory mentioning the entity
+            table_name: Name of the type-specific table
+
+        Returns:
+            The ID of the created/found entity, or None on failure
+        """
+        now = datetime.now()
+
+        check_cypher = f"""
+            MATCH (e:{table_name})
+            WHERE e.canonical_name = '{entity.text.replace("'", "''")}'
+            RETURN e.id
+        """
+        raw_result = self.conn.execute(check_cypher)
+        result = _get_result(raw_result)
+
+        entity_id: int
+        if result.has_next():
+            row = result.get_next()
+            entity_id = int(row[0])
+        else:
+            embedding = self._get_embedding(entity.text)
+            embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+            create_cypher = f"""
+                CREATE (e:{table_name} {{
+                    canonical_name: '{entity.text.replace("'", "''")}',
+                    entity_type: '{entity.entity_type}',
+                    embedding: {embedding_str},
+                    metadata: NULL,
+                    created_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}'),
+                    updated_at: timestamp('{now.strftime("%Y-%m-%d %H:%M:%S")}')
+                }})
+                RETURN e.id
+            """
+            raw_result = self.conn.execute(create_cypher)
+            result = _get_result(raw_result)
+            if not result.has_next():
+                return None
+            row = result.get_next()
+            entity_id = int(row[0])
+
+        rel_table_name = f"MentionedIn_{table_name}"
+        mention_cypher = f"""
+            MATCH (e:{table_name}), (m:Memory)
+            WHERE e.id = {entity_id} AND m.id = {memory_id}
+            CREATE (e)-[r:{rel_table_name} {{
+                mention_text: '{entity.text.replace("'", "''")}',
+                confidence: {entity.confidence},
+                span_start: {entity.start_pos},
+                span_end: {entity.end_pos}
+            }}]->(m)
+        """
+        self.conn.execute(mention_cypher)
+
+        return entity_id
+
+    def _create_sourced_from_relation(
+        self, typed_entity_id: int, source_entity_id: int, table_name: str
+    ) -> None:
+        """Create a SourcedFrom relation from typed entity to source Entity.
+
+        Args:
+            typed_entity_id: ID of the entity in the typed table
+            source_entity_id: ID of the source entity in the generic Entity table
+            table_name: Name of the typed table
+        """
+        rel_table_name = f"SourcedFrom_{table_name}"
+        try:
+            self.conn.execute(
+                f"""
+                CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
+                    FROM {table_name} TO Entity
+                )
+                """
+            )
+        except Exception:
+            pass
+
+        cypher = f"""
+            MATCH (typed:{table_name}), (source:Entity)
+            WHERE typed.id = {typed_entity_id} AND source.id = {source_entity_id}
+            CREATE (typed)-[r:{rel_table_name}]->(source)
+        """
+        self.conn.execute(cypher)
