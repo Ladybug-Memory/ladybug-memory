@@ -201,7 +201,7 @@ def main():
         memory_id=entry.id,
     )
 
-    print(f"Entities moved to typed tables:")
+    print("Entities moved to typed tables:")
     for table_name, count in sorted(counts.items()):
         print(f"  - {table_name}: {count} entities")
 

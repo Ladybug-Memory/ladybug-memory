@@ -36,7 +36,6 @@ class LogicalChunker:
     def chunk(self, text: str) -> list[LogicalUnit]:
         """Split text into logical units."""
         units = []
-        pos = 0
 
         paragraphs = self._split_paragraphs(text)
 

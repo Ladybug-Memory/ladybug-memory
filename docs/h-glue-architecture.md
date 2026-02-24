@@ -55,7 +55,7 @@ The LLM analyzes the document to identify:
       ]
     },
     {
-      "type": "section", 
+      "type": "section",
       "title": "Financial Results",
       "children": [
         {
@@ -79,7 +79,7 @@ Before invoking an LLM for structure analysis, the system first checks if the do
    - JSON/XML with nested structures
    - LaTeX with `\section`, `\subsection` commands
    - Word documents with heading styles
-   
+
    For these formats, extract the hierarchy directly using pattern matching or parsing libraries.
 
 2. **Unstructured Documents (LLM required):**
@@ -139,7 +139,7 @@ Given the following context from "{document_title}" > "{section_title}":
 
 Context: {logical_unit_text}
 
-Extract entities with their types, confidence, and any relationships mentioned. 
+Extract entities with their types, confidence, and any relationships mentioned.
 Focus on entities that are ambiguous or require domain knowledge.
 
 Output format: JSON with entity, type, confidence, rationale
@@ -296,10 +296,10 @@ async def analyze_document_structure(document: str, model: str = "gpt-3.5-turbo"
     prompt = f"""
     Analyze the following document and return a JSON tree structure of its logical components.
     Identify sections, subsections, paragraphs, lists, and tables.
-    
+
     Document:
     {document[:4000]}  # Truncate for token limits
-    
+
     Return format:
     {{
       "type": "document",
@@ -309,13 +309,13 @@ async def analyze_document_structure(document: str, model: str = "gpt-3.5-turbo"
       ]
     }}
     """
-    
+
     response = await llm_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
-    
+
     return DocumentTree.parse(response.choices[0].message.content)
 ```
 
@@ -327,38 +327,38 @@ class AdaptiveEntityExtractor:
         self.gliner = gliner_model
         self.llm = llm_client
         self.confidence_threshold = 0.85
-        
+
     async def extract(self, text: str, context: Dict) -> List[Entity]:
         # Try GLiNER2 first
         gliner_entities = self.gliner.predict(text, labels=ENTITY_TYPES)
-        
+
         entities = []
         low_confidence_spans = []
-        
+
         for ent in gliner_entities:
             if ent.confidence >= self.confidence_threshold:
                 entities.append(Entity.from_gliner(ent, context))
             else:
                 low_confidence_spans.append((ent.start, ent.end))
-        
+
         # Use LLM for low-confidence regions
         if low_confidence_spans:
             llm_entities = await self._llm_extract(text, low_confidence_spans, context)
             entities.extend(llm_entities)
-        
+
         return entities
-    
+
     async def _llm_extract(self, text: str, spans: List[Tuple], context: Dict) -> List[Entity]:
         # Extract text around low-confidence spans
         regions = [text[max(0, s-50):min(len(text), e+50)] for s, e in spans]
-        
+
         prompt = f"""
         Extract entities from these text regions:
         {json.dumps(regions)}
-        
+
         Context: {context.get('section_title', 'Unknown')}
         """
-        
+
         response = await self.llm.chat.completions.create(...)
         return parse_llm_entities(response)
 ```
@@ -370,7 +370,7 @@ class EntityDisambiguator:
     def __init__(self, embedding_model, similarity_threshold=0.85):
         self.embedder = embedding_model
         self.threshold = similarity_threshold
-        
+
     def disambiguate(self, entities: List[Entity]) -> List[EntityCluster]:
         # Generate embeddings with context
         embeddings = []
@@ -378,13 +378,13 @@ class EntityDisambiguator:
             context = ent.get_surrounding_text(window=50)
             emb = self.embedder.encode(f"{ent.text} | Context: {context}")
             embeddings.append(emb)
-        
+
         # Compute similarity matrix
         sim_matrix = cosine_similarity(embeddings)
-        
+
         # Hierarchical clustering
         clusters = self._cluster_entities(entities, sim_matrix)
-        
+
         # Merge each cluster into canonical entity
         return [self._create_canonical_entity(c) for c in clusters]
 ```

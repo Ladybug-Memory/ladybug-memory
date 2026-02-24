@@ -48,8 +48,7 @@ class LadybugMemory(AgentMemory):
         self.conn.execute("INSTALL JSON; LOAD EXTENSION JSON;")
         self.conn.execute("INSTALL FTS; LOAD EXTENSION FTS;")
         self.conn.execute("INSTALL vector; LOAD EXTENSION vector;")
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE NODE TABLE IF NOT EXISTS Memory(
                 id SERIAL PRIMARY KEY,
                 content STRING,
@@ -60,26 +59,22 @@ class LadybugMemory(AgentMemory):
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )
-            """
-        )
-        self.conn.execute(
-            """
+            """)
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS MemoryLink(
                 FROM Memory TO Memory,
                 relation STRING,
                 start_timestamp TIMESTAMP DEFAULT current_timestamp(),
                 end_timestamp TIMESTAMP DEFAULT current_timestamp()
             )
-            """
-        )
+            """)
         # Entity schema for knowledge graph
         self._init_entity_schema()
 
     def _init_entity_schema(self) -> None:
         """Initialize entity and mention tables for knowledge graph."""
         # Entity nodes (canonical entities after disambiguation)
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE NODE TABLE IF NOT EXISTS Entity(
                 id SERIAL PRIMARY KEY,
                 canonical_name STRING,
@@ -89,11 +84,9 @@ class LadybugMemory(AgentMemory):
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )
-            """
-        )
+            """)
         # Entity mention edges (links entities to memories)
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS MentionedIn(
                 FROM Entity TO Memory,
                 mention_text STRING,
@@ -101,20 +94,16 @@ class LadybugMemory(AgentMemory):
                 span_start INT64,
                 span_end INT64
             )
-            """
-        )
+            """)
         # Coreference edges (links similar entities)
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS Coreference(
                 FROM Entity TO Entity,
                 similarity_score FLOAT
             )
-            """
-        )
+            """)
         # Relations edges (extracted relations between entities)
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS Relations(
                 FROM Entity TO Entity,
                 relation_type STRING,
@@ -125,11 +114,9 @@ class LadybugMemory(AgentMemory):
                 start_timestamp TIMESTAMP DEFAULT current_timestamp(),
                 end_timestamp TIMESTAMP DEFAULT current_timestamp()
             )
-            """
-        )
+            """)
         # Logical chunks for H-GLUE architecture
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE NODE TABLE IF NOT EXISTS LogicalChunk(
                 id SERIAL PRIMARY KEY,
                 text STRING,
@@ -139,29 +126,23 @@ class LadybugMemory(AgentMemory):
                 embedding FLOAT[384],
                 created_at TIMESTAMP
             )
-            """
-        )
+            """)
         # Entity to chunk relationship
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS AppearsIn(
                 FROM Entity TO LogicalChunk,
                 mention_text STRING,
                 confidence FLOAT
             )
-            """
-        )
+            """)
         # Chunk to memory relationship
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE REL TABLE IF NOT EXISTS ChunkOf(
                 FROM LogicalChunk TO Memory
             )
-            """
-        )
+            """)
         # Discovered schema types (tracks hierarchy: specific_type IS_A base_type)
-        self.conn.execute(
-            """
+        self.conn.execute("""
             CREATE NODE TABLE IF NOT EXISTS DiscoveredSchemaType(
                 id SERIAL PRIMARY KEY,
                 type_name STRING,
@@ -171,21 +152,18 @@ class LadybugMemory(AgentMemory):
                 entity_count INT64,
                 created_at TIMESTAMP
             )
-            """
-        )
+            """)
 
     def _init_fts_index(self) -> None:
         try:
-            self.conn.execute(
-                """
+            self.conn.execute("""
                 CALL CREATE_FTS_INDEX(
                     'Memory',
                     'memory_content_fts',
                     ['content'],
                     stemmer := 'porter'
                 )
-                """
-            )
+                """)
         except Exception:
             pass
 
@@ -203,16 +181,14 @@ class LadybugMemory(AgentMemory):
 
     def _init_vector_search(self) -> None:
         try:
-            self.conn.execute(
-                """
+            self.conn.execute("""
                 CALL CREATE_VECTOR_INDEX(
                     'Memory',
                     'memory_content_index',
                     'embedding',
                     metric := 'cosine'
                 )
-                """
-            )
+                """)
         except Exception:
             pass
 
@@ -922,9 +898,11 @@ class LadybugMemory(AgentMemory):
             mentioned_memories.append(
                 {
                     "memory_id": str(row[0]),
-                    "content_preview": str(row[1])[:200] + "..."
-                    if len(str(row[1])) > 200
-                    else str(row[1]),
+                    "content_preview": (
+                        str(row[1])[:200] + "..."
+                        if len(str(row[1])) > 200
+                        else str(row[1])
+                    ),
                     "mention_confidence": float(row[2]) if row[2] else 0.0,
                 }
             )
@@ -1009,8 +987,7 @@ class LadybugMemory(AgentMemory):
             # Check if table already exists
             try:
                 # Create node table for this entity type
-                self.conn.execute(
-                    f"""
+                self.conn.execute(f"""
                     CREATE NODE TABLE IF NOT EXISTS {table_name}(
                         id SERIAL PRIMARY KEY,
                         canonical_name STRING,
@@ -1021,13 +998,11 @@ class LadybugMemory(AgentMemory):
                         created_at TIMESTAMP,
                         updated_at TIMESTAMP
                     )
-                    """
-                )
+                    """)
 
                 # Create relationship table for mentions
                 rel_table_name = f"MentionedIn_{table_name}"
-                self.conn.execute(
-                    f"""
+                self.conn.execute(f"""
                     CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
                         FROM {table_name} TO Memory,
                         mention_text STRING,
@@ -1035,8 +1010,7 @@ class LadybugMemory(AgentMemory):
                         span_start INT64,
                         span_end INT64
                     )
-                    """
-                )
+                    """)
 
                 table_mapping[type_name] = table_name
 
@@ -1431,13 +1405,11 @@ class LadybugMemory(AgentMemory):
                 chunk_id = int(row[0])
                 chunk_ids.append(chunk_id)
 
-                self.conn.execute(
-                    f"""
+                self.conn.execute(f"""
                     MATCH (c:LogicalChunk), (m:Memory)
                     WHERE c.id = {chunk_id} AND m.id = {memory_id}
                     CREATE (c)-[r:ChunkOf]->(m)
-                    """
-                )
+                    """)
             else:
                 chunk_ids.append(None)
 
@@ -1482,16 +1454,14 @@ class LadybugMemory(AgentMemory):
         if res.has_next():
             return
 
-        self.conn.execute(
-            f"""
+        self.conn.execute(f"""
             MATCH (e:Entity), (c:LogicalChunk)
             WHERE e.id = {entity_id} AND c.id = {chunk_id}
             CREATE (e)-[r:AppearsIn {{
                 mention_text: '{entity.text.replace("'", "''")}',
                 confidence: {entity.confidence}
             }}]->(c)
-            """
-        )
+            """)
 
     def _store_entity_in_typed_table(
         self,
@@ -1572,13 +1542,11 @@ class LadybugMemory(AgentMemory):
         """
         rel_table_name = f"SourcedFrom_{table_name}"
         try:
-            self.conn.execute(
-                f"""
+            self.conn.execute(f"""
                 CREATE REL TABLE IF NOT EXISTS {rel_table_name}(
                     FROM {table_name} TO Entity
                 )
-                """
-            )
+                """)
         except Exception:
             pass
 
