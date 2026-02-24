@@ -27,7 +27,7 @@ def main():
     print("\n1. Storing memory with entity extraction:")
     print(f"   Content: {content[:100]}...")
 
-    entry, entities = memory.store_with_entities(
+    entry, entities, relations_count = memory.store_with_entities(
         content=content,
         memory_type="news",
         importance=8,

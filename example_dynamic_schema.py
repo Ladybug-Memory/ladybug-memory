@@ -47,7 +47,7 @@ def main():
     print("\n1. Extracting entities from multiple memories...")
     for i, content in enumerate(contents, 1):
         print(f"   Processing memory {i}/{len(contents)}...")
-        entry, entities = memory.store_with_entities(
+        entry, entities, _ = memory.store_with_entities(
             content=content,
             memory_type="news",
             importance=8,
