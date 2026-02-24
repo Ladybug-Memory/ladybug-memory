@@ -10,6 +10,8 @@ dependencies = [
     "gliner2>=0.0.1",
     "icebug>=12.0",
     "polars>=1.38.1",
+    "dotenv>=0.9.9",
+    "litellm>=1.81.15",
 ]
 
 [project.optional-dependencies]
