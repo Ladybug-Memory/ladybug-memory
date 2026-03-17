@@ -5,10 +5,10 @@ description = "Agent memory interface implemented using LadybugDB"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "real-ladybug>=0.14.0",
+    "real-ladybug>=0.15.2",
     "fastembed",
     "gliner2>=1.2.4",
-    "icebug>=12.0",
+    "icebug>=12.2",
     "polars>=1.38.1",
     "dotenv>=0.9.9",
     "litellm>=1.81.15",

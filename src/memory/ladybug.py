@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, cast
+import json
 import uuid
 
 import real_ladybug as lb
@@ -232,40 +233,24 @@ class LadybugMemory(AgentMemory):
             "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        if metadata:
-            import json
-
-            parameters["metadata"] = json.dumps(metadata)
-            raw_result = self.conn.execute(
-                """
-                CREATE (m:Memory {
-                    content: $content,
-                    memory_type: $memory_type,
-                    importance: $importance,
-                    metadata: CAST($metadata AS JSON),
-                    embedding: $embedding,
-                    created_at: timestamp($created_at),
-                    updated_at: timestamp($updated_at)
-                })
-                RETURN m.id
-                """,
-                parameters=parameters,
-            )
-        else:
-            raw_result = self.conn.execute(
-                """
-                CREATE (m:Memory {
-                    content: $content,
-                    memory_type: $memory_type,
-                    importance: $importance,
-                    embedding: $embedding,
-                    created_at: timestamp($created_at),
-                    updated_at: timestamp($updated_at)
-                })
-                RETURN m.id
-                """,
-                parameters=parameters,
-            )
+        if not metadata:
+            metadata = {}
+        parameters["metadata"] = json.dumps(metadata)
+        raw_result = self.conn.execute(
+            """
+            CREATE (m:Memory {
+                content: $content,
+                memory_type: $memory_type,
+                importance: $importance,
+                metadata: CAST($metadata AS JSON),
+                embedding: $embedding,
+                created_at: timestamp($created_at),
+                updated_at: timestamp($updated_at)
+            })
+            RETURN m.id
+            """,
+            parameters=parameters,
+        )
 
         result = _get_result(raw_result)
         row = result.get_next()
@@ -711,8 +696,6 @@ class LadybugMemory(AgentMemory):
         start_timestamp: datetime | None = None,
         end_timestamp: datetime | None = None,
     ) -> None:
-        import json
-
         now = datetime.now()
         start_ts = start_timestamp or now
         end_ts = end_timestamp or now
@@ -783,7 +766,7 @@ class LadybugMemory(AgentMemory):
                 CREATE (s)-[r:Relations {
                     relation_type: $relation_type,
                     confidence: $confidence,
-                    metadata: $metadata,
+                    metadata: CAST($metadata AS JSON),
                     start_timestamp: timestamp($start_timestamp),
                     end_timestamp: timestamp($end_timestamp)
                 }]->(t)
@@ -1109,8 +1092,6 @@ class LadybugMemory(AgentMemory):
         Returns:
             Number of schema types stored
         """
-        import json
-
         now = datetime.now()
         count = 0
 
@@ -1170,8 +1151,6 @@ class LadybugMemory(AgentMemory):
         Returns:
             List of schema type dicts with type_name, base_type, etc.
         """
-        import json
-
         cypher = """
             MATCH (s:DiscoveredSchemaType)
             RETURN s.type_name, s.base_type, s.confidence, s.sample_entities, s.entity_count
