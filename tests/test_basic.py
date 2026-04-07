@@ -1,7 +1,7 @@
 import pytest
 import tempfile
 import os
-from memory import LadybugMemory
+from lbmemory import LadybugMemory
 
 
 @pytest.fixture

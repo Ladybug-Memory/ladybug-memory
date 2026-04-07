@@ -1,7 +1,7 @@
 import pytest
 import tempfile
 import os
-from memory import LadybugMemory, DynamicSchemaDiscovery
+from lbmemory import LadybugMemory, DynamicSchemaDiscovery
 
 
 @pytest.fixture

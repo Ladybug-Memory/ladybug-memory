@@ -5,7 +5,7 @@ from typing import Any
 
 from gliner2 import GLiNER2
 
-from memory.entities import Entity, ExtractedEntity, Relation
+from lbmemory.entities import Entity, ExtractedEntity, Relation
 
 SCHEMA_ORG_RELATIONS = [
     "author",

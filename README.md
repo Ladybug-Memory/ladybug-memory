@@ -16,7 +16,7 @@ uv pip install ladybug-memory
 ```
 
 ```python
-from memory import LadybugMemory
+from lbmemory import LadybugMemory
 
 mem = LadybugMemory("memory.lbdb")
 

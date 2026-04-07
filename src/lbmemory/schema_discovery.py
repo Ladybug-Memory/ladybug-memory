@@ -21,7 +21,7 @@ import networkit as nk
 from fastembed import TextEmbedding
 from litellm import completion
 
-from memory.entities import Entity
+from lbmemory.entities import Entity
 
 # Global registry to keep Arrow arrays alive
 # Key: graph id, Value: dict with Arrow arrays

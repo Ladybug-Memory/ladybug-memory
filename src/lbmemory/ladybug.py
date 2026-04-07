@@ -6,10 +6,10 @@ import uuid
 import real_ladybug as lb
 from fastembed import TextEmbedding
 
-from memory.chunker import LogicalChunker
-from memory.entities import Entity
-from memory.extraction import GLiNEREntityExtractor
-from memory.interface import (
+from lbmemory.chunker import LogicalChunker
+from lbmemory.entities import Entity
+from lbmemory.extraction import GLiNEREntityExtractor
+from lbmemory.interface import (
     AgentMemory,
     MemoryEntry,
     MemorySearchResult,

@@ -5,7 +5,7 @@ import os
 
 from dotenv import load_dotenv
 
-from memory import LadybugMemory, DynamicSchemaDiscovery
+from lbmemory import LadybugMemory, DynamicSchemaDiscovery
 
 # Load environment variables from .env file
 load_dotenv()
