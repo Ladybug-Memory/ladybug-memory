@@ -3,6 +3,12 @@ import tempfile
 import os
 from lbmemory import LadybugMemory
 
+pytest.importorskip(
+    "gliner2",
+    reason="Entity extraction tests require the 'extract' extra. "
+    "Install with: pip install ladybug-memory[extract]",
+)
+
 
 @pytest.fixture
 def memory():

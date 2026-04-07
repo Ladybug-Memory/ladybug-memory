@@ -8,7 +8,7 @@ from lbmemory import LadybugMemory
 def memory():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "memory.lbdb")
-        mem = LadybugMemory(db_path)
+        mem = LadybugMemory(db_path, enable_entity_extraction=False)
         yield mem
 
 

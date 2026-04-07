@@ -8,12 +8,18 @@ from fastembed import TextEmbedding
 
 from lbmemory.chunker import LogicalChunker
 from lbmemory.entities import Entity
-from lbmemory.extraction import GLiNEREntityExtractor
 from lbmemory.interface import (
     AgentMemory,
     MemoryEntry,
     MemorySearchResult,
 )
+
+try:
+    from lbmemory.extraction import GLiNEREntityExtractor
+
+    _GLINER_AVAILABLE = True
+except ImportError:
+    _GLINER_AVAILABLE = False
 
 
 def _get_result(result: lb.QueryResult | list[lb.QueryResult]) -> lb.QueryResult:
@@ -38,8 +44,13 @@ class LadybugMemory(AgentMemory):
 
         # Entity extraction
         self._enable_entity_extraction = enable_entity_extraction
-        self._entity_extractor: GLiNEREntityExtractor | None = None
+        self._entity_extractor = None
         if enable_entity_extraction:
+            if not _GLINER_AVAILABLE:
+                raise ImportError(
+                    "Entity extraction requires the 'extract' extra. "
+                    "Install with: pip install ladybug-memory[extract]"
+                )
             self._entity_extractor = GLiNEREntityExtractor(
                 model_name=gliner_model,
                 confidence_threshold=entity_confidence_threshold,

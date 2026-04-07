@@ -3,6 +3,12 @@ import tempfile
 import os
 from lbmemory import LadybugMemory, DynamicSchemaDiscovery
 
+pytest.importorskip(
+    "gliner2",
+    reason="Dynamic schema tests require the 'extract' extra. "
+    "Install with: pip install ladybug-memory[extract]",
+)
+
 
 @pytest.fixture
 def memory():
