@@ -33,6 +33,10 @@ jobs:
       - name: Set up runtime
         run: uv sync --all-extras --all-groups
 
+      - name: Fix libomp conflict (macOS)
+        if: runner.os == 'macOS'
+        run: cp /opt/homebrew/opt/libomp/lib/libomp.dylib .venv/lib/python${{ matrix.python-version }}/site-packages/torch/lib/libomp.dylib
+
       - name: Run linter
         run: uv run ruff check .
 
