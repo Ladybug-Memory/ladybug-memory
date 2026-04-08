@@ -1217,7 +1217,7 @@ class LadybugMemory(AgentMemory):
         if not self._entity_extractor:
             return entry, results
 
-        from memory.schema_discovery import DynamicSchemaDiscovery
+        from lbmemory.schema_discovery import DynamicSchemaDiscovery
 
         extractor = self._entity_extractor
 
