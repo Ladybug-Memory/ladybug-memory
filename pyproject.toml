@@ -24,7 +24,7 @@ kg = [
     "polars",
 ]
 extract = [
-    "gliner2>=1.2.4",
+    "gliner2==1.2.4",
 ]
 
 [build-system]
