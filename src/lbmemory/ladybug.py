@@ -3,7 +3,7 @@ from typing import Any, cast
 import json
 import uuid
 
-import real_ladybug as lb
+import ladybug as lb
 from fastembed import TextEmbedding
 
 from lbmemory.chunker import LogicalChunker
