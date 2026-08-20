@@ -30,6 +30,15 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libomp
 
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install -y openssl.light
+          $osslDir = Get-ChildItem "C:\Program Files\OpenSSL*\bin" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $osslDir) { throw "OpenSSL bin directory not found" }
+          Add-Content -Path $env:GITHUB_PATH -Value $osslDir.FullName
+          Write-Host "Added $($osslDir.FullName) to PATH"
+
       - name: Set up runtime
         run: uv sync --all-extras --all-groups
 
